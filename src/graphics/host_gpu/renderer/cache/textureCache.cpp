@@ -2601,7 +2601,8 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		    // Separate from m_lock: the GPU thread may wait for this callback while it owns the
 		    // texture cache lock (for example on staging wrap). Keep overlapping records distinct.
 		    std::lock_guard lock(m_pending_download_mutex);
-		    const auto      pending = std::ranges::find(m_pending_downloads, range);
+		    const auto      pending =
+		        std::ranges::find_if(m_pending_downloads, [range](const auto& item) { return item == range; });
 		    EXIT_IF(pending == m_pending_downloads.end());
 		    m_pending_downloads.erase(pending);
 		    (void)owner;
