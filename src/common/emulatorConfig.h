@@ -4,7 +4,9 @@
 #include "common/common.h"
 
 #include <cstddef>
+#include <array>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,7 @@ enum class PresentMode { Fifo, Mailbox, Immediate };
 enum class BdaSyncMode { Selective, Legacy, SelectiveChecked };
 
 using Keymap = std::vector<std::string>;
+using ControllerColor = std::array<uint8_t, 3>;
 
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
 constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
@@ -46,6 +49,7 @@ struct ConfigOptions {
 	std::string            user_name                   = "Kyty";
 	int32_t                user_id                     = DEFAULT_USER_ID;
 	std::string            audio_input_device;
+	std::optional<ControllerColor> controller_color;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	BdaSyncMode            bda_sync_mode                   = BdaSyncMode::Selective;
 	int32_t                gpu_index                   = -1;
@@ -98,6 +102,7 @@ uint32_t GetScreenHeight();
 const std::string& GetUserName();
 int32_t  GetUserId();
 const std::string& GetAudioInputDevice();
+const std::optional<ControllerColor>& GetControllerColor();
 PresentMode GetPresentMode();
 BdaSyncMode        GetBdaSyncMode();
 int32_t GetGpuIndex();

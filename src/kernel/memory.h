@@ -121,7 +121,7 @@ void                   ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t
 // Copies a range within one page when ReadGuestOnGpuThread would read it as a plain copy (no
 // GPU-dirty hint on the page); false otherwise, and nothing is read.
 bool                   TryReadGuestPlainOnGpuThread(uint64_t vaddr, void* data, uint64_t size);
-bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
+bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
