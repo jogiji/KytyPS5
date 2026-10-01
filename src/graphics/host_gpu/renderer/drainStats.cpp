@@ -38,6 +38,9 @@ struct Snapshot {
 	std::vector<uint64_t> value = std::vector<uint64_t>(CellCount);
 	uint64_t              frames   = 0;
 	uint64_t              presents = 0;
+	uint64_t              suspend_calls  = 0;
+	uint64_t              suspend_ns     = 0;
+	uint64_t              suspend_max_ns = 0;
 };
 
 Cell                  g_cells[CellCount];
@@ -322,6 +325,9 @@ Snapshot Take() {
 	for (size_t i = 0; i < FrameBuckets; i++) {
 		snapshot.frame_ms[i] = g_frame_ms[i].load(std::memory_order_relaxed);
 	}
+	snapshot.suspend_calls  = g_suspend_stats.calls.load(std::memory_order_relaxed);
+	snapshot.suspend_ns     = g_suspend_stats.wait_ns.load(std::memory_order_relaxed);
+	snapshot.suspend_max_ns = g_suspend_stats.max_ns.load(std::memory_order_relaxed);
 	return snapshot;
 }
 
@@ -379,12 +385,20 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds, bool 
 	    "drain-stats: {:.1f}s frames={} ({:.1f}/s) presents={}", seconds, frames,
 	    frames / seconds, after.presents - before.presents);
 	for (const auto kind: {Kind::FullDrain, Kind::TickWait, Kind::PriorityWait, Kind::BlockedPoll,
-	                       Kind::Submit, Kind::QueueLockWait, Kind::GpuBusy, Kind::GpuGap}) {
+	                       Kind::Submit, Kind::QueueLockWait, Kind::GpuBusy, Kind::GpuGap,
+	                       Kind::GpuThreadIdle}) {
 		const auto k  = static_cast<size_t>(kind);
 		const auto ms = static_cast<double>(kind_value[k]) / 1e6;
 		text += fmt::format(" | {} n={} {:.1f}ms ({:.2f}ms/frame)", KindName(kind), kind_count[k],
 		                    ms, per(ms));
 	}
+	const auto susp_calls = after.suspend_calls - before.suspend_calls;
+	const auto susp_ns    = after.suspend_ns - before.suspend_ns;
+	const auto susp_ms    = static_cast<double>(susp_ns) / 1e6;
+	const auto susp_avg_ms = susp_calls == 0 ? 0.0 : susp_ms / static_cast<double>(susp_calls);
+	const auto susp_max_ms = static_cast<double>(after.suspend_max_ns) / 1e6;
+	text += fmt::format(" | suspend-wait n={} {:.1f}ms ({:.2f}ms/frame avg={:.3f}ms max={:.1f}ms)",
+	                    susp_calls, susp_ms, per(susp_ms), susp_avg_ms, susp_max_ms);
 	const auto rb = static_cast<size_t>(Kind::Readback);
 	text += fmt::format(" | readback n={} {:.1f}MiB clean={}\n", kind_count[rb],
 	                    static_cast<double>(kind_value[rb]) / (1024.0 * 1024.0),
@@ -447,7 +461,7 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds, bool 
 	for (size_t i = 0; i < site_order.size(); i++) site_order[i] = i;
 	std::sort(site_order.begin(), site_order.end(),
 	          [&](size_t a, size_t b) { return site_rows[a]->ns > site_rows[b]->ns; });
-	for (size_t i = 0; i < std::min<size_t>(site_order.size(), 8); i++) {
+	for (size_t i = 0; i < std::min<size_t>(site_order.size(), 20); i++) {
 		const auto& site = *site_rows[site_order[i]];
 		const auto  pc   = site_keys[site_order[i]] & ~(uint64_t {1} << 63u);
 		const auto  ms   = static_cast<double>(site.ns) / 1e6;

@@ -251,7 +251,17 @@ void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
 	// finish the preceding graphics frame. The first point returns immediately.
+	const auto start = std::chrono::steady_clock::now();
 	m_suspend_point_ready->acquire();
+	const auto elapsed_ns = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(
+	        std::chrono::steady_clock::now() - start).count());
+	DrainStats::g_suspend_stats.calls.fetch_add(1, std::memory_order_relaxed);
+	DrainStats::g_suspend_stats.wait_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
+	uint64_t prev_max = DrainStats::g_suspend_stats.max_ns.load(std::memory_order_relaxed);
+	while (elapsed_ns > prev_max &&
+	       !DrainStats::g_suspend_stats.max_ns.compare_exchange_weak(prev_max, elapsed_ns,
+	                                                                 std::memory_order_relaxed));
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));

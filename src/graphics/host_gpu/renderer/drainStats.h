@@ -62,6 +62,13 @@ enum class Kind : uint8_t {
 	Count,
 };
 
+struct SuspendStats {
+	std::atomic<uint64_t> calls {0};
+	std::atomic<uint64_t> wait_ns {0};
+	std::atomic<uint64_t> max_ns {0};
+};
+inline SuspendStats g_suspend_stats;
+
 // GPU work zones (KYTY_GPU_ZONES=1 with --drain-stats). The render scheduler timestamps each
 // change of zone in its recording buffer and charges the interval up to the next timestamp to
 // the zone that opened it. Work recorded without a mark joins the zone before it.
