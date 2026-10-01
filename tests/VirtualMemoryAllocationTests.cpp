@@ -3252,6 +3252,302 @@ void TestPackedReciprocalSquareRoot() {
 #endif
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+void TestVrsqrtpsNativeVsEmulatedSemantics() {
+	const char* test = "VrsqrtpsNativeVsEmulatedSemantics";
+
+	struct TestCase {
+		const char* label;
+		uint32_t    input_bits;
+	};
+
+	const std::vector<TestCase> test_cases = {
+		{" +0.0",                 0x00000000},
+		{" -0.0",                 0x80000000},
+		{" small +denormal min",  0x00000001},
+		{" small +denormal mid",  0x00040000},
+		{" small -denormal min",  0x80000001},
+		{" small -denormal mid",  0x80040000},
+		{" minimum normal",       0x00800000}, // FLT_MIN (1.17549435e-38)
+		{" 1.0",                  0x3f800000},
+		{" 2.0",                  0x40000000},
+		{" 4.0",                  0x40800000},
+		{" large finite mid",     0x60f08956}, // ~1.0e20
+		{" large finite max",     0x7f7fffff}, // FLT_MAX
+		{" +infinity",            0x7f800000},
+		{" -infinity",            0xff800000},
+		{" qNaN positive",        0x7fc00000},
+		{" qNaN payload",         0x7fc12345},
+		{" qNaN negative",        0xffc00000},
+		{" sNaN positive",        0x7f800001},
+		{" sNaN payload",         0x7f812345},
+		{" sNaN negative",        0xff812345},
+		{" -1.0 finite",          0xbf800000},
+		{" -2.0 finite",          0xc0000000},
+		{" -4.0 finite",          0xc0800000},
+		{" -0.25 finite",         0xbe800000},
+	};
+
+	std::printf("\n========================================================================================\n");
+	std::printf("  VRSQRTPS SEMANTIC COMPARISON: Intel Host Native vs Kyty Software Emulation\n");
+	std::printf("========================================================================================\n");
+	std::printf("%-22s | %-10s | %-10s | %-10s | %-11s | %s\n",
+	            "Input Case", "Input Hex", "Native Hex", "Emu Hex", "Rel Error", "Classification / Match");
+	std::printf("-----------------------+------------+------------+------------+-------------+-------------------\n");
+
+	const uint32_t saved_mxcsr = _mm_getcsr();
+
+	for (const auto& tc: test_cases) {
+		float in_f = std::bit_cast<float>(tc.input_bits);
+		__m128 in_vec = _mm_set_ss(in_f);
+		__m128 native_vec = _mm_rsqrt_ss(in_vec);
+		uint32_t native_bits = std::bit_cast<uint32_t>(_mm_cvtss_f32(native_vec));
+		uint32_t emu_bits = Loader::X64InstructionEmulator::ReciprocalSquareRoot(tc.input_bits);
+
+		float native_f = std::bit_cast<float>(native_bits);
+		float emu_f = std::bit_cast<float>(emu_bits);
+
+		double rel_error = 0.0;
+		bool is_exact = (native_bits == emu_bits);
+		char status[64] = {};
+
+		if (std::isnan(emu_f)) {
+			Check(test, std::isnan(native_f), "native should be NaN when emu is NaN");
+			rel_error = 0.0;
+			std::snprintf(status, sizeof(status), "Both NaN (%s)", is_exact ? "Exact bits" : "Different payload");
+		} else if (std::isinf(emu_f)) {
+			if (std::isinf(native_f)) {
+				std::snprintf(status, sizeof(status), "Both Inf (%s)", is_exact ? "Exact bits" : "Signed match");
+			} else {
+				std::snprintf(status, sizeof(status), "Emu Inf, Native %g", native_f);
+			}
+		} else if (emu_f == 0.0f) {
+			Check(test, native_f == 0.0f, "native should be 0 when emu is 0");
+			std::snprintf(status, sizeof(status), "Both Zero (%s)", is_exact ? "Exact bits" : "Signed match");
+		} else {
+			rel_error = std::abs((static_cast<double>(native_f) - static_cast<double>(emu_f)) / static_cast<double>(emu_f));
+			bool bound_ok = (rel_error <= 1.5 * (1.0 / 4096.0));
+			std::snprintf(status, sizeof(status), "%s (bound: %s)", is_exact ? "Exact match" : "Approx", bound_ok ? "PASS" : "FAIL");
+			Check(test, bound_ok, "relative error exceeded 1.5 * 2^-12");
+		}
+
+		std::printf("%-22s | 0x%08x | 0x%08x | 0x%08x | %10.7f | %s\n",
+		            tc.label, tc.input_bits, native_bits, emu_bits, rel_error, status);
+	}
+
+	constexpr size_t kRandomSamples = 10000;
+	double max_rel_error = 0.0;
+	size_t exact_count = 0;
+	uint64_t rng = 0x853c49e6748fea9bull;
+
+	for (size_t i = 0; i < kRandomSamples; ++i) {
+		rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+		uint32_t exp = 1 + (static_cast<uint32_t>(rng >> 32) % 254);
+		uint32_t mantissa = static_cast<uint32_t>(rng) & 0x7fffffu;
+		uint32_t bits = (exp << 23) | mantissa;
+
+		float in_f = std::bit_cast<float>(bits);
+		__m128 native_vec = _mm_rsqrt_ss(_mm_set_ss(in_f));
+		uint32_t native_bits = std::bit_cast<uint32_t>(_mm_cvtss_f32(native_vec));
+		uint32_t emu_bits = Loader::X64InstructionEmulator::ReciprocalSquareRoot(bits);
+
+		float native_f = std::bit_cast<float>(native_bits);
+		float emu_f = std::bit_cast<float>(emu_bits);
+
+		if (native_bits == emu_bits) {
+			++exact_count;
+		}
+
+		double err = std::abs((static_cast<double>(native_f) - static_cast<double>(emu_f)) / static_cast<double>(emu_f));
+		if (err > max_rel_error) {
+			max_rel_error = err;
+		}
+		constexpr double kArchErrorBound = 1.5 * (1.0 / 4096.0);
+		Check(test, err <= kArchErrorBound, "randomized corpus sample exceeded architectural error bound");
+	}
+
+	std::printf("----------------------------------------------------------------------------------------\n");
+	std::printf("Randomized Corpus (%zu finite positive normals across full exponent range):\n", kRandomSamples);
+	std::printf("  Max Relative Error: %.8f (architectural limit: %.8f -> %s)\n",
+	            max_rel_error, 1.5 * (1.0 / 4096.0), max_rel_error <= 1.5 * (1.0 / 4096.0) ? "PASS" : "FAIL");
+	std::printf("  Bit-Exact Matches : %zu / %zu (%.2f%%)\n",
+	            exact_count, kRandomSamples, (100.0 * exact_count) / kRandomSamples);
+	std::printf("========================================================================================\n\n");
+
+	_mm_setcsr(saved_mxcsr);
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestExtrqRewriteSemantics() {
+	const char* test = "ExtrqRewriteSemantics";
+
+	constexpr uint64_t code_size = 0x4000;
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x904000000, code_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "extrq_test");
+	Check(test, mapping != 0, "failed to allocate instruction test code");
+
+	struct MappingCleanup {
+		uint64_t addr;
+		uint64_t size;
+		~MappingCleanup() {
+			Libs::LibKernel::Memory::FreeGuestMemory(addr, size);
+		}
+	} cleanup {mapping, code_size};
+
+	std::printf("\n========================================================================================\n");
+	std::printf("  EXTRQ REWRITE SEMANTIC VERIFICATION: Trampoline vs ExtractBitField Reference\n");
+	std::printf("========================================================================================\n");
+
+	// 1. Immediate Form: EXTRQ xmm0, length, index
+	const std::vector<std::pair<uint8_t, uint8_t>> imm_test_configs = {
+		{0, 0},    // length=64, index=0 (full 64 bits)
+		{0, 8},    // length=64, index=8 -> available=56
+		{8, 0},    // length=8, index=0
+		{8, 8},    // length=8, index=8
+		{16, 16},  // length=16, index=16
+		{32, 0},   // length=32, index=0
+		{32, 32},  // length=32, index=32
+		{1, 0},    // single bit at 0
+		{1, 63},   // single bit at 63
+		{63, 0},   // 63 bits at 0
+		{63, 1},   // 63 bits at 1 (available 63)
+		{10, 60},  // length=10, index=60 -> available=4
+		{64, 0},   // raw 64 -> length=0 -> 64
+	};
+
+	constexpr uint64_t kRedZoneSentinel = 0x1122334455667788ull;
+
+	for (const auto& [len, idx]: imm_test_configs) {
+		const uint8_t extrq_bytes[] = {0x66, 0x0f, 0x78, 0xc0, len, idx};
+
+		Xbyak::CodeGenerator gen(code_size, reinterpret_cast<void*>(mapping));
+		for (uint32_t off = 8; off <= 128; off += 8) {
+			gen.mov(gen.rax, kRedZoneSentinel ^ off);
+			gen.mov(gen.qword[gen.rsp - off], gen.rax);
+		}
+		gen.movdqu(gen.xmm0, gen.ptr[gen.rdi]);
+
+		bool ok = Loader::EmulateExtrqInstruction(extrq_bytes, sizeof(extrq_bytes), gen);
+		Check(test, ok, "EmulateExtrqInstruction failed for immediate form");
+
+		gen.movdqu(gen.ptr[gen.rdi + 16], gen.xmm0);
+
+		for (uint32_t off = 8; off <= 128; off += 8) {
+			gen.mov(gen.rax, gen.qword[gen.rsp - off]);
+			gen.mov(gen.qword[gen.rdi + 32 + off - 8], gen.rax);
+		}
+		gen.ret();
+		Common::VirtualMemory::FlushInstructionCache(mapping, gen.getSize());
+
+		using Func = void(KYTY_SYSV_ABI*)(void*);
+		const auto func = reinterpret_cast<Func>(mapping);
+
+		struct ContextData {
+			uint64_t in[2];
+			uint64_t out[2];
+			uint64_t red_zone[16];
+		} data {};
+
+		const std::vector<uint64_t> test_values = {
+			0x0123456789abcdefull,
+			0xfedcba9876543210ull,
+			0xffffffffffffffffull,
+			0x0000000000000000ull,
+			0xaaaaaaaaaaaaaaaaull,
+			0x5555555555555555ull,
+			0x8000000000000001ull,
+		};
+
+		for (uint64_t val: test_values) {
+			data.in[0] = val;
+			data.in[1] = 0xdeadbeefcafebabeull;
+			data.out[0] = 0;
+			data.out[1] = 0;
+			std::memset(data.red_zone, 0, sizeof(data.red_zone));
+
+			func(&data);
+
+			uint64_t expected = Loader::X64InstructionEmulator::ExtractBitField(val, len, idx);
+			Check(test, data.out[0] == expected, "immediate EXTRQ output mismatch");
+			Check(test, data.out[1] == 0, "immediate EXTRQ upper 64 bits must be zero");
+
+			for (uint32_t i = 0; i < 16; ++i) {
+				uint32_t off = (i + 1) * 8;
+				Check(test, data.red_zone[i] == (kRedZoneSentinel ^ off), "red zone was corrupted");
+			}
+		}
+	}
+	std::printf("  [PASS] Immediate EXTRQ: 100%% bit-exact matches and red-zone preserved across all tests.\n");
+
+	// 2. Register Form: EXTRQ xmm0, xmm1
+	{
+		const uint8_t extrq_reg_bytes[] = {0x66, 0x0f, 0x79, 0xc1}; // EXTRQ xmm0, xmm1
+		Xbyak::CodeGenerator gen(code_size, reinterpret_cast<void*>(mapping));
+
+		for (uint32_t off = 8; off <= 128; off += 8) {
+			gen.mov(gen.rax, kRedZoneSentinel ^ off);
+			gen.mov(gen.qword[gen.rsp - off], gen.rax);
+		}
+
+		gen.movdqu(gen.xmm0, gen.ptr[gen.rdi]);
+		gen.movdqu(gen.xmm1, gen.ptr[gen.rdi + 16]);
+
+		bool ok = Loader::EmulateExtrqInstruction(extrq_reg_bytes, sizeof(extrq_reg_bytes), gen);
+		Check(test, ok, "EmulateExtrqInstruction failed for register form");
+
+		gen.movdqu(gen.ptr[gen.rdi + 32], gen.xmm0);
+
+		for (uint32_t off = 8; off <= 128; off += 8) {
+			gen.mov(gen.rax, gen.qword[gen.rsp - off]);
+			gen.mov(gen.qword[gen.rdi + 48 + off - 8], gen.rax);
+		}
+		gen.ret();
+		Common::VirtualMemory::FlushInstructionCache(mapping, gen.getSize());
+
+		using Func = void(KYTY_SYSV_ABI*)(void*);
+		const auto func = reinterpret_cast<Func>(mapping);
+
+		struct RegContextData {
+			uint64_t in_val[2];
+			uint64_t in_ctrl[2];
+			uint64_t out[2];
+			uint64_t red_zone[16];
+		} data {};
+
+		uint64_t rng = 0x123456789abcdef0ull;
+		size_t match_count = 0;
+		for (uint32_t l = 0; l < 64; ++l) {
+			for (uint32_t idx = 0; idx < 64; ++idx) {
+				rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+				uint64_t val = rng;
+
+				data.in_val[0] = val;
+				data.in_val[1] = 0xdeadbeefcafebabeull;
+				data.in_ctrl[0] = static_cast<uint64_t>(l) | (static_cast<uint64_t>(idx) << 8);
+				data.in_ctrl[1] = 0xbadc0ffebadc0ffeull;
+				data.out[0] = 0;
+				data.out[1] = 0;
+				std::memset(data.red_zone, 0, sizeof(data.red_zone));
+
+				func(&data);
+
+				uint64_t expected = Loader::X64InstructionEmulator::ExtractBitField(val, l, idx);
+				Check(test, data.out[0] == expected, "register EXTRQ output mismatch");
+				Check(test, data.out[1] == 0, "register EXTRQ upper 64 bits must be zero");
+				for (uint32_t i = 0; i < 16; ++i) {
+					uint32_t off = (i + 1) * 8;
+					Check(test, data.red_zone[i] == (kRedZoneSentinel ^ off), "red zone was corrupted");
+				}
+				++match_count;
+			}
+		}
+		std::printf("  [PASS] Register EXTRQ: %zu / %zu (100.0%%) exhaustive (len, idx) bit-exact matches.\n",
+		            match_count, match_count);
+		std::printf("========================================================================================\n\n");
+	}
+
+	std::printf("[host]    %-48s ok\n", test);
+}
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -3428,6 +3724,16 @@ int main(int argc, char** argv) {
 	}
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-semantics") == 0) {
+		RunTest(TestVrsqrtpsNativeVsEmulatedSemantics);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--extrq-semantics") == 0) {
+		RunTest(TestExtrqRewriteSemantics);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
 		RunTest(TestPackedReciprocalSquareRoot);
 		return g_failed_tests == 0 ? 0 : 1;

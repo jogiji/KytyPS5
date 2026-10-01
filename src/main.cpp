@@ -117,6 +117,8 @@ static void PrintUsage() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
+	::printf("  --native-vrsqrtps <true|false>       Execute VRSQRTPS natively on AVX-capable hosts.\n");
+	::printf("  --rewrite-extrq <true|false>         Rewrite EXTRQ to fast inline trampolines.\n");
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 }
@@ -267,6 +269,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 #endif
+
+		if (arg == "--native-vrsqrtps" && (i + 1 >= argc || std::string(argv[i + 1]).starts_with("--"))) {
+			options.config.native_vrsqrtps_enabled = true;
+			continue;
+		}
+
+		if (arg == "--rewrite-extrq" && (i + 1 >= argc || std::string(argv[i + 1]).starts_with("--"))) {
+			options.config.rewrite_extrq_enabled = true;
+			continue;
+		}
 
 		if (!arg.starts_with("--")) {
 			::printf("game input must be provided with --game\n");
@@ -518,6 +530,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--readback-linear-images") {
 			if (!ParseBool(value, options.config.readback_linear_images)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--native-vrsqrtps") {
+			if (!ParseBool(value, options.config.native_vrsqrtps_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--rewrite-extrq") {
+			if (!ParseBool(value, options.config.rewrite_extrq_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

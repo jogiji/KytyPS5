@@ -24,6 +24,8 @@ enum class InstructionType : uint8_t {
 
 const char* InstructionTypeName(InstructionType type);
 
+uint32_t           ReciprocalSquareRoot(uint32_t bits);
+uint64_t           ExtractBitField(uint64_t value, uint32_t length, uint32_t index);
 [[nodiscard]] bool IsReciprocalSquareRoot(const ZydisDecodedInstruction& instruction,
                                          const ZydisDecodedOperand* operands);
 uint64_t           PatchReciprocalSquareRoots(uint64_t address, uint64_t size);

@@ -33,7 +33,7 @@
 
 namespace Loader::X64InstructionEmulator {
 
-static uint64_t ExtractBitField(uint64_t value, uint32_t length, uint32_t index) {
+uint64_t ExtractBitField(uint64_t value, uint32_t length, uint32_t index) {
 	length &= 0x3fu;
 	index &= 0x3fu;
 
@@ -895,7 +895,7 @@ static bool TryEmulateAmdSystem(Context& context, InstructionType* out_type = nu
 	}
 }
 
-static uint32_t ReciprocalSquareRoot(uint32_t bits) {
+uint32_t ReciprocalSquareRoot(uint32_t bits) {
 	const uint32_t magnitude = bits & 0x7fffffffu;
 	const uint32_t exponent  = magnitude & 0x7f800000u;
 	if (exponent == 0) {

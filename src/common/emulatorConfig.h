@@ -92,6 +92,8 @@ struct ConfigOptions {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
+	bool                   native_vrsqrtps_enabled     = false;
+	bool                   rewrite_extrq_enabled       = false;
 	Keymap keymap;
 };
 
@@ -186,6 +188,8 @@ bool HardwareBufferBoundsEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif
+bool NativeVrsqrtpsEnabled();
+bool RewriteExtrqEnabled();
 
 const Keymap& GetKeymap();
 

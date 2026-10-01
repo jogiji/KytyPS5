@@ -254,6 +254,14 @@ bool RedZoneProtectionEnabled() {
 }
 #endif
 
+bool NativeVrsqrtpsEnabled() {
+	return g_config->native_vrsqrtps_enabled;
+}
+
+bool RewriteExtrqEnabled() {
+	return g_config->rewrite_extrq_enabled;
+}
+
 const Keymap& GetKeymap() {
 	return g_config->keymap;
 }

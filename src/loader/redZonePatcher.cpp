@@ -140,6 +140,7 @@ struct DecodedFunction {
 struct InstructionRewrite {
 	bool protect_red_zone {};
 	bool protected_indirect_call {};
+	bool emulate_extrq {};
 };
 
 bool IsStackPointerRegister(ZydisRegister reg) {
@@ -764,6 +765,127 @@ bool GenerateProtectedIndirectCall(const DecodedCodeInstruction& decoded,
 	return true;
 }
 
+bool GenerateEmulatedExtrq(const ZydisDecodedInstruction& instruction,
+                           const ZydisDecodedOperand*     operands,
+                           Xbyak::CodeGenerator&          generator) {
+	if (instruction.mnemonic != ZYDIS_MNEMONIC_EXTRQ) {
+		return false;
+	}
+	if (operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    operands[0].reg.value < ZYDIS_REGISTER_XMM0 ||
+	    operands[0].reg.value > ZYDIS_REGISTER_XMM15) {
+		return false;
+	}
+
+	const int dest_idx = operands[0].reg.value - ZYDIS_REGISTER_XMM0;
+	const Xbyak::Xmm dest_xmm(dest_idx);
+
+	if (operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+		if (operands[2].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+			return false;
+		}
+		const uint32_t raw_len = static_cast<uint32_t>(operands[1].imm.value.u);
+		const uint32_t raw_idx = static_cast<uint32_t>(operands[2].imm.value.u);
+		uint32_t len = raw_len & 0x3fu;
+		const uint32_t idx = raw_idx & 0x3fu;
+		if (len == 0) {
+			len = 64;
+		}
+		const uint32_t available = (idx >= 64) ? 0 : (64 - idx);
+		if (len > available) {
+			len = available;
+		}
+
+		generator.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+		generator.pushfq();
+		generator.push(rax);
+
+		if (len == 0) {
+			generator.xor_(eax, eax);
+			generator.movq(dest_xmm, rax);
+		} else if (len == 64 && idx == 0) {
+			generator.movq(rax, dest_xmm);
+			generator.movq(dest_xmm, rax);
+		} else {
+			generator.movq(rax, dest_xmm);
+			const uint32_t shl_count = 64 - (idx + len);
+			const uint32_t shr_count = 64 - len;
+			if (shl_count > 0) {
+				generator.shl(rax, shl_count);
+			}
+			if (shr_count > 0) {
+				generator.shr(rax, shr_count);
+			}
+			generator.movq(dest_xmm, rax);
+		}
+
+		generator.pop(rax);
+		generator.popfq();
+		generator.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+		return true;
+	}
+
+	if (operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	    operands[1].reg.value >= ZYDIS_REGISTER_XMM0 &&
+	    operands[1].reg.value <= ZYDIS_REGISTER_XMM15) {
+		const int src_idx = operands[1].reg.value - ZYDIS_REGISTER_XMM0;
+		const Xbyak::Xmm src_xmm(src_idx);
+
+		generator.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+		generator.pushfq();
+		generator.push(rax);
+		generator.push(rcx);
+		generator.push(rdx);
+
+		generator.movq(rax, dest_xmm);
+		generator.movq(rdx, src_xmm);
+
+		generator.mov(ecx, edx);
+		generator.shr(ecx, 8);
+		generator.and_(ecx, 0x3f);
+		generator.and_(edx, 0x3f);
+
+		generator.shr(rax, cl);
+
+		Xbyak::Label mask_done;
+		generator.test(edx, edx);
+		generator.jz(mask_done);
+		generator.cmp(edx, 64);
+		generator.jae(mask_done);
+
+		generator.mov(ecx, edx);
+		generator.mov(rdx, UINT64_MAX);
+		generator.shl(rdx, cl);
+		generator.not_(rdx);
+		generator.and_(rax, rdx);
+
+		generator.L(mask_done);
+
+		generator.movq(dest_xmm, rax);
+
+		generator.pop(rdx);
+		generator.pop(rcx);
+		generator.pop(rax);
+		generator.popfq();
+		generator.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+		return true;
+	}
+
+	return false;
+}
+
+void CollectExtrqInstructions(const DecodedFunction&                   function,
+                              std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                              RedZonePatchResult&                     result) {
+	for (const auto& [address, decoded]: function.instructions) {
+		if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_EXTRQ) {
+			continue;
+		}
+		++result.extrq_instruction_count;
+		rewrite_sites[address].emulate_extrq = true;
+	}
+}
+
 void CollectRedZoneMemoryInstructions(const DecodedFunction& function,
                                       std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                                       RedZonePatchResult& result) {
@@ -868,13 +990,22 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 				const auto rewrite = rewrite_sites.find(decoded->address);
 				const bool protected_indirect_call =
 				    rewrite != rewrite_sites.end() && rewrite->second.protected_indirect_call;
+				const bool emulate_extrq =
+				    rewrite != rewrite_sites.end() && rewrite->second.emulate_extrq;
 				const bool protect_red_zone = rewrite != rewrite_sites.end() &&
 				                              rewrite->second.protect_red_zone &&
-				                              !protected_indirect_call;
+				                              !protected_indirect_call &&
+				                              !emulate_extrq;
 				if (protect_red_zone) {
 					module->trampoline_gen.lea(rsp, ptr[rsp - GuestRedZoneSize]);
 				}
-				if (protected_indirect_call) {
+				if (emulate_extrq) {
+					if (!GenerateEmulatedExtrq(decoded->instruction, decoded->operands.data(),
+					                           module->trampoline_gen)) {
+						module->trampoline_gen.setSize(trampoline_offset);
+						return std::nullopt;
+					}
+				} else if (protected_indirect_call) {
 					if (!GenerateProtectedIndirectCall(*decoded, module->trampoline_gen)) {
 						module->trampoline_gen.setSize(trampoline_offset);
 						return std::nullopt;
@@ -1269,9 +1400,23 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 }
 } // namespace
 
+bool EmulateExtrqInstruction(const void* instruction_bytes, size_t instruction_length,
+                             ::Xbyak::CodeGenerator& generator) {
+	ZydisDecodedInstruction instruction {};
+	std::array<ZydisDecodedOperand, ZYDIS_MAX_OPERAND_COUNT> operands {};
+	const auto status = ZydisDecoderDecodeFull(&GetDecoder(), instruction_bytes,
+	                                           instruction_length, &instruction,
+	                                           operands.data());
+	if (!ZYAN_SUCCESS(status)) {
+		return false;
+	}
+	return GenerateEmulatedExtrq(instruction, operands.data(), generator);
+}
+
 RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
                                           std::span<const uintptr_t> function_starts,
-                                          bool protect_memory, bool emulate_rsqrt) {
+                                          bool protect_memory, bool emulate_rsqrt,
+                                          bool rewrite_extrq) {
 	RedZonePatchResult result {};
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
 	if (module == nullptr || function_starts.empty()) {
@@ -1312,6 +1457,9 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 			++result.red_zone_function_count;
 			result.indirect_red_zone_function_count += function.has_indirect_branch;
 		}
+		if (rewrite_extrq) {
+			CollectExtrqInstructions(function, rewrite_sites, result);
+		}
 		if (protect_memory) {
 			CollectRedZoneMemoryInstructions(function, rewrite_sites, result);
 		}
@@ -1340,7 +1488,7 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 
 #else
 
-RedZonePatchResult PatchGuestInstructions(u64, u64, std::span<const uintptr_t>, bool, bool) {
+RedZonePatchResult PatchGuestInstructions(u64, u64, std::span<const uintptr_t>, bool, bool, bool) {
 	return {};
 }
 
