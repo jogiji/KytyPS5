@@ -539,6 +539,7 @@ target_include_directories(ngs2_sampler_tests PRIVATE ${inc_headers})
 
 add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 )
 target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
