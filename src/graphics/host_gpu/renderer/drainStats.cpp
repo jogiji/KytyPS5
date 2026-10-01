@@ -2,6 +2,7 @@
 
 #include "common/logging/log.h"
 #include "kernel/pthread.h"
+#include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
 #include <array>
@@ -408,6 +409,7 @@ void Report(const Snapshot& before, const Snapshot& after, double seconds, bool 
 	if (interval) {
 		text += ZoneSummary(frames);
 	}
+	text += Loader::X64InstructionEmulator::FormatEmulationReport(frames, seconds, interval);
 
 	std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
 		const bool a_time = IsTimeKind(a.kind);

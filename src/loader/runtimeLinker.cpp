@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -659,9 +660,30 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
-	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
-	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
-		return true;
+	if (info->type == Common::HostException::ExceptionType::IllegalInstruction) {
+		const auto t0 = std::chrono::steady_clock::now();
+		Loader::X64InstructionEmulator::InstructionType emu_type =
+		    Loader::X64InstructionEmulator::InstructionType::Unknown;
+		const bool emulated =
+		    Loader::X64InstructionEmulator::TryEmulate(info->native_context, &emu_type);
+		const auto t1 = std::chrono::steady_clock::now();
+		const uint64_t dur_ns =
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+
+		char thread_name[64] = "(host thread)";
+		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
+				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest)");
+			}
+		}
+
+		Loader::X64InstructionEmulator::RecordEmulation(
+		    emulated ? emu_type : Loader::X64InstructionEmulator::InstructionType::Unhandled,
+		    info->exception_address, dur_ns, thread_name);
+
+		if (emulated) {
+			return true;
+		}
 	}
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {

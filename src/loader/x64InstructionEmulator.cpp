@@ -3,8 +3,16 @@
 #include "common/common.h"
 
 #include <Zydis/Zydis.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstring>
+#include <fmt/format.h>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 #if !defined(__APPLE__)
 #include <emmintrin.h>
 #include <xmmintrin.h>
@@ -723,7 +731,7 @@ static bool TryEmulateShaNi(Context& context) {
 
 #endif
 
-static bool TryEmulateSse4a(Context& context) {
+static bool TryEmulateSse4a(Context& context, InstructionType* out_type = nullptr) {
 	const auto*   rip    = reinterpret_cast<const uint8_t*>(context.Rip());
 	const uint8_t prefix = rip[0];
 	if (prefix != 0x66 && prefix != 0xf2 && prefix != 0xf3) {
@@ -773,9 +781,15 @@ static bool TryEmulateSse4a(Context& context) {
 		std::memcpy(&source, src_xmm, sizeof(source));
 		if (prefix == 0xf2) {
 			std::memcpy(address, &source, sizeof(source));
+			if (out_type != nullptr) {
+				*out_type = InstructionType::Movntsd;
+			}
 		} else {
 			const uint32_t value = static_cast<uint32_t>(source);
 			std::memcpy(address, &value, sizeof(value));
+			if (out_type != nullptr) {
+				*out_type = InstructionType::Movntss;
+			}
 		}
 		context.Advance(instruction_length);
 		return true;
@@ -815,8 +829,14 @@ static bool TryEmulateSse4a(Context& context) {
 	if (prefix == 0x66) {
 		dest[0] = ExtractBitField(dest[0], length, index);
 		dest[1] = 0;
+		if (out_type != nullptr) {
+			*out_type = InstructionType::Extrq;
+		}
 	} else {
 		dest[0] = InsertBitField(dest[0], source, length, index);
+		if (out_type != nullptr) {
+			*out_type = InstructionType::Insertq;
+		}
 	}
 	std::memcpy(dest_xmm, dest, sizeof(dest));
 	context.Advance(instruction_length);
@@ -843,7 +863,7 @@ static bool TryEmulateMonitorxMwaitx(Context& context) {
 	return true;
 }
 
-static bool TryEmulateAmdSystem(Context& context) {
+static bool TryEmulateAmdSystem(Context& context, InstructionType* out_type = nullptr) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
 	if (rip[0] != 0x0f || rip[1] != 0x01) {
 		return false;
@@ -859,11 +879,17 @@ static bool TryEmulateAmdSystem(Context& context) {
 			}
 			std::memset(reinterpret_cast<void*>(address), 0, 64);
 			context.Advance(3);
+			if (out_type != nullptr) {
+				*out_type = InstructionType::Clzero;
+			}
 			return true;
 		}
 		case 0xfd: // RDPRU: return an approximate host counter in EDX:EAX.
 			context.StoreRdpru(EmulateRdpru(static_cast<uint32_t>(gpr[1])));
 			context.Advance(3);
+			if (out_type != nullptr) {
+				*out_type = InstructionType::Rdpru;
+			}
 			return true;
 		default: return false;
 	}
@@ -978,7 +1004,10 @@ uint64_t PatchReciprocalSquareRoots(uint64_t address, uint64_t size) {
 	return patched;
 }
 
-bool TryEmulate(void* native_context) {
+bool TryEmulate(void* native_context, InstructionType* out_type) {
+	if (out_type != nullptr) {
+		*out_type = InstructionType::Unknown;
+	}
 	if (native_context == nullptr) {
 		return false;
 	}
@@ -995,14 +1024,210 @@ bool TryEmulate(void* native_context) {
 #endif
 #if !defined(__APPLE__)
 	if (TryEmulateReciprocalSquareRoot(context)) {
+		if (out_type != nullptr) {
+			*out_type = InstructionType::Vrsqrtps;
+		}
 		return true;
 	}
-	return TryEmulateMonitorxMwaitx(context) || TryEmulateAmdSystem(context) ||
-	       TryEmulateSse4a(context) ||
-	       TryEmulateShaNi(context);
+	if (TryEmulateMonitorxMwaitx(context)) {
+		if (out_type != nullptr) {
+			*out_type = InstructionType::MonitorxMwaitx;
+		}
+		return true;
+	}
+	if (TryEmulateAmdSystem(context, out_type)) {
+		return true;
+	}
+	if (TryEmulateSse4a(context, out_type)) {
+		return true;
+	}
+	if (TryEmulateShaNi(context)) {
+		if (out_type != nullptr) {
+			*out_type = InstructionType::ShaNi;
+		}
+		return true;
+	}
+	return false;
 #else
-	return TryEmulateSse4a(context);
+	return TryEmulateSse4a(context, out_type);
 #endif
+}
+
+const char* InstructionTypeName(InstructionType type) {
+	switch (type) {
+		case InstructionType::Vrsqrtps: return "vrsqrtps";
+		case InstructionType::Rdpru: return "rdpru";
+		case InstructionType::Clzero: return "clzero";
+		case InstructionType::Movntss: return "movntss";
+		case InstructionType::Movntsd: return "movntsd";
+		case InstructionType::Extrq: return "extrq";
+		case InstructionType::Insertq: return "insertq";
+		case InstructionType::MonitorxMwaitx: return "monitorx_mwaitx";
+		case InstructionType::ShaNi: return "shani";
+		case InstructionType::Unhandled: return "unhandled";
+		default: return "unknown";
+	}
+}
+
+namespace {
+
+struct CumulativeEmulationStats {
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(InstructionType::Count)> counts {};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(InstructionType::Count)> total_ns {};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(InstructionType::Count)> max_ns {};
+	std::atomic<uint64_t> total_ud_count {0};
+	std::atomic<uint64_t> total_ud_ns {0};
+};
+
+struct EmulationSite {
+	uint64_t        pc         = 0;
+	InstructionType type       = InstructionType::Unknown;
+	std::string     thread_name;
+	uint64_t        count      = 0;
+	uint64_t        total_ns   = 0;
+	uint64_t        max_ns     = 0;
+};
+
+static CumulativeEmulationStats                      g_cum_stats;
+static std::mutex                                     g_emu_site_mutex;
+static std::unordered_map<uint64_t, EmulationSite>    g_emu_sites;
+
+struct EmulationSnapshot {
+	std::array<uint64_t, static_cast<size_t>(InstructionType::Count)> counts {};
+	std::array<uint64_t, static_cast<size_t>(InstructionType::Count)> total_ns {};
+	uint64_t                                                          total_ud_count = 0;
+	uint64_t                                                          total_ud_ns    = 0;
+};
+
+static EmulationSnapshot g_last_snapshot {};
+
+} // namespace
+
+void RecordEmulation(InstructionType type, uint64_t pc, uint64_t duration_ns,
+                     const char* thread_name) {
+	const auto idx = static_cast<size_t>(type);
+	if (idx < static_cast<size_t>(InstructionType::Count)) {
+		g_cum_stats.counts[idx].fetch_add(1, std::memory_order_relaxed);
+		g_cum_stats.total_ns[idx].fetch_add(duration_ns, std::memory_order_relaxed);
+		auto prev_max = g_cum_stats.max_ns[idx].load(std::memory_order_relaxed);
+		while (duration_ns > prev_max &&
+		       !g_cum_stats.max_ns[idx].compare_exchange_weak(prev_max, duration_ns,
+		                                                      std::memory_order_relaxed)) {}
+	}
+	g_cum_stats.total_ud_count.fetch_add(1, std::memory_order_relaxed);
+	g_cum_stats.total_ud_ns.fetch_add(duration_ns, std::memory_order_relaxed);
+
+	std::lock_guard lock(g_emu_site_mutex);
+	auto&           site = g_emu_sites[pc];
+	if (site.count == 0) {
+		site.pc          = pc;
+		site.type        = type;
+		site.thread_name = (thread_name != nullptr && thread_name[0] != '\0') ? thread_name : "(unnamed)";
+	}
+	site.count++;
+	site.total_ns += duration_ns;
+	if (duration_ns > site.max_ns) {
+		site.max_ns = duration_ns;
+	}
+}
+
+std::string FormatEmulationReport(uint64_t frames, double seconds, bool interval) {
+	EmulationSnapshot current {};
+	for (size_t i = 0; i < static_cast<size_t>(InstructionType::Count); ++i) {
+		current.counts[i]   = g_cum_stats.counts[i].load(std::memory_order_relaxed);
+		current.total_ns[i] = g_cum_stats.total_ns[i].load(std::memory_order_relaxed);
+	}
+	current.total_ud_count = g_cum_stats.total_ud_count.load(std::memory_order_relaxed);
+	current.total_ud_ns    = g_cum_stats.total_ud_ns.load(std::memory_order_relaxed);
+
+	uint64_t delta_ud_count = 0;
+	uint64_t delta_ud_ns    = 0;
+	std::array<uint64_t, static_cast<size_t>(InstructionType::Count)> delta_counts {};
+	std::array<uint64_t, static_cast<size_t>(InstructionType::Count)> delta_ns {};
+
+	if (interval) {
+		delta_ud_count = current.total_ud_count - g_last_snapshot.total_ud_count;
+		delta_ud_ns    = current.total_ud_ns - g_last_snapshot.total_ud_ns;
+		for (size_t i = 0; i < static_cast<size_t>(InstructionType::Count); ++i) {
+			delta_counts[i] = current.counts[i] - g_last_snapshot.counts[i];
+			delta_ns[i]     = current.total_ns[i] - g_last_snapshot.total_ns[i];
+		}
+		g_last_snapshot = current;
+	} else {
+		delta_ud_count = current.total_ud_count;
+		delta_ud_ns    = current.total_ud_ns;
+		for (size_t i = 0; i < static_cast<size_t>(InstructionType::Count); ++i) {
+			delta_counts[i] = current.counts[i];
+			delta_ns[i]     = current.total_ns[i];
+		}
+	}
+
+	std::unordered_map<uint64_t, EmulationSite> sites;
+	{
+		std::lock_guard lock(g_emu_site_mutex);
+		if (interval) {
+			sites.swap(g_emu_sites);
+		} else {
+			sites = g_emu_sites;
+		}
+	}
+
+	const auto per = [frames](double value) -> double {
+		return frames == 0 ? 0.0 : value / static_cast<double>(frames);
+	};
+
+	const double total_emu_ms = static_cast<double>(delta_ud_ns) / 1e6;
+	const double ud_per_sec   = seconds > 0.0 ? static_cast<double>(delta_ud_count) / seconds : 0.0;
+	const double ud_per_frame = per(static_cast<double>(delta_ud_count));
+	const double emu_ms_per_frame = per(total_emu_ms);
+
+	// Estimated Windows x64 VEH hardware #UD trap roundtrip overhead is ~2.5 µs (0.0025 ms) per trap.
+	const double est_veh_ms = total_emu_ms + static_cast<double>(delta_ud_count) * 0.0025;
+	const double est_veh_ms_per_frame = per(est_veh_ms);
+
+	std::string text;
+	if (delta_ud_count == 0) {
+		text = fmt::format(
+		    "cpu-emulation: {:.1f}s #UD=0 (0.0/s, 0.0/frame) | total=0.00ms (0.00ms/frame) | no illegal instruction traps\n",
+		    seconds);
+	} else {
+		text = fmt::format(
+		    "cpu-emulation: {:.1f}s #UD={} ({:.1f}/s, {:.1f}/frame) | total={:.2f}ms ({:.2f}ms/frame) | est-veh={:.2f}ms ({:.2f}ms/frame) | vrsqrtps={} rdpru={} clzero={} movntss={} movntsd={} extrq={} insertq={} monitorx_mwaitx={} shani={} unhandled={}\n",
+		    seconds, delta_ud_count, ud_per_sec, ud_per_frame,
+		    total_emu_ms, emu_ms_per_frame,
+		    est_veh_ms, est_veh_ms_per_frame,
+		    delta_counts[static_cast<size_t>(InstructionType::Vrsqrtps)],
+		    delta_counts[static_cast<size_t>(InstructionType::Rdpru)],
+		    delta_counts[static_cast<size_t>(InstructionType::Clzero)],
+		    delta_counts[static_cast<size_t>(InstructionType::Movntss)],
+		    delta_counts[static_cast<size_t>(InstructionType::Movntsd)],
+		    delta_counts[static_cast<size_t>(InstructionType::Extrq)],
+		    delta_counts[static_cast<size_t>(InstructionType::Insertq)],
+		    delta_counts[static_cast<size_t>(InstructionType::MonitorxMwaitx)],
+		    delta_counts[static_cast<size_t>(InstructionType::ShaNi)],
+		    delta_counts[static_cast<size_t>(InstructionType::Unhandled)]);
+
+		std::vector<const EmulationSite*> site_rows;
+		for (const auto& [pc, site]: sites) {
+			site_rows.push_back(&site);
+		}
+		std::sort(site_rows.begin(), site_rows.end(),
+		          [](const EmulationSite* a, const EmulationSite* b) {
+			          return a->total_ns > b->total_ns;
+		          });
+
+		const size_t print_count = std::min<size_t>(site_rows.size(), 50);
+		for (size_t i = 0; i < print_count; ++i) {
+			const auto&  s       = *site_rows[i];
+			const double site_ms = static_cast<double>(s.total_ns) / 1e6;
+			const double avg_ms  = s.count == 0 ? 0.0 : site_ms / static_cast<double>(s.count);
+			const double max_ms  = static_cast<double>(s.max_ns) / 1e6;
+			text += fmt::format(
+			    "  emu-site       {:<14} pc={:#014x} thread={:<24} n={:<6} {:8.2f}ms avg={:.3f}ms max={:.3f}ms\n",
+			    InstructionTypeName(s.type), s.pc, s.thread_name, s.count, site_ms, avg_ms, max_ms);
+		}
+	}
+	return text;
 }
 
 } // namespace Loader::X64InstructionEmulator
