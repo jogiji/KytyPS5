@@ -6,3 +6,6 @@ _Build/vscode-clang/
 _Build/
 cmake-build-debug/
 _PipelineCache/
+_SaveData/
+_perf_*.log
+run_astro_profile.ps1
