@@ -326,8 +326,8 @@ bool WritesRegister(const DecodedCodeInstruction& decoded, ZydisRegister reg) {
 
 std::optional<std::vector<uintptr_t>>
 ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_address,
-                        uintptr_t function_start, uintptr_t function_end, uintptr_t segment_start,
-                        uintptr_t segment_end) {
+                        uintptr_t function_start, uintptr_t function_end, uintptr_t module_start,
+                        uintptr_t module_end) {
 	const auto branch = function.instructions.find(branch_address);
 	if (branch == function.instructions.end() ||
 	    branch->second.instruction.mnemonic != ZYDIS_MNEMONIC_JMP ||
@@ -346,7 +346,7 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 		           : function.instructions.end();
 	};
 
-	constexpr size_t MaxInterveningInstructions = 4;
+	constexpr size_t MaxInterveningInstructions = 64;
 	auto             add                        = function.instructions.end();
 	auto             pattern_cursor             = branch;
 	for (size_t count = 0; count <= MaxInterveningInstructions; ++count) {
@@ -481,8 +481,8 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 
 	std::optional<std::vector<uintptr_t>> resolved_targets;
 	for (const uintptr_t table_address: table_candidates) {
-		if (table_address < segment_start || table_address > segment_end ||
-		    *table_size > (segment_end - table_address) / sizeof(s32)) {
+		if (table_address < module_start || table_address > module_end ||
+		    *table_size > (module_end - table_address) / sizeof(s32)) {
 			continue;
 		}
 
@@ -516,7 +516,7 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 }
 
 DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
-                               uintptr_t segment_start, uintptr_t segment_end) {
+                               uintptr_t module_start, uintptr_t module_end) {
 	DecodedFunction               function;
 	std::vector<uintptr_t>        blocks {function_start};
 	std::unordered_set<uintptr_t> visited;
@@ -572,7 +572,7 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 				continue;
 			}
 			const auto targets = ResolveBoundedJumpTable(function, branch_address, function_start,
-			                                             function_end, segment_start, segment_end);
+			                                             function_end, module_start, module_end);
 			if (!targets) {
 				continue;
 			}
@@ -1312,7 +1312,9 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 		std::optional<RelocationSpan> selected_span;
 		std::optional<size_t>         trampoline_offset;
 		const auto&                   site_instruction       = function.instructions.at(site);
-		const bool                    can_relocate_neighbors = !function.has_indirect_branch;
+		const auto&                   site_rewrite           = rewrite_sites.at(site);
+		const bool                    is_emulated_site       = site_rewrite.emulate_vrsqrtps || site_rewrite.emulate_extrq;
+		const bool                    can_relocate_neighbors = !function.has_indirect_branch || is_emulated_site;
 		if (can_relocate_neighbors || site_instruction.instruction.length >= NearJumpSize) {
 			auto forward_span = collect_forward_span();
 			if (forward_span) {
@@ -1375,7 +1377,9 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 
 		const auto site_instruction = function.instructions.find(site);
 		ASSERT(site_instruction != function.instructions.end());
-		if (function.has_indirect_branch ||
+		const auto& site_rewrite = rewrite_sites.at(site);
+		const bool  is_emulated  = site_rewrite.emulate_vrsqrtps || site_rewrite.emulate_extrq;
+		if ((function.has_indirect_branch && !is_emulated) ||
 		    site_instruction->second.instruction.length < ShortJumpSize) {
 			record_unsupported(site);
 			continue;
@@ -1661,7 +1665,9 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 		}
 
 		++result.function_count;
-		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
+		const auto module_start = reinterpret_cast<uintptr_t>(module->start);
+		const auto module_end   = reinterpret_cast<uintptr_t>(module->end);
+		auto function = DecodeFunction(function_start, function_end, module_start, module_end);
 		AnalyzeRedZoneLiveness(function);
 		result.instruction_count += function.instructions.size();
 

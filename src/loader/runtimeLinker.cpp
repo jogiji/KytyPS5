@@ -1980,28 +1980,40 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			const auto result =
 			    PatchGuestInstructions(segment_addr, segment_size, function_starts,
 			                           protect_memory_faults, emulate_rsqrt, rewrite_extrq, rewrite_vrsqrtps);
-			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
-			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
-			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 ", extrq=%" PRIu64 ", vrsqrtps=%" PRIu64 "\n",
-			     Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
-			     result.red_zone_function_count, result.memory_instruction_count,
-			     result.patched_memory_instruction_count, result.short_memory_instruction_count,
-			     result.stack_dependent_memory_instruction_count,
-			     result.control_flow_memory_instruction_count,
-			     result.unrelocatable_memory_instruction_count,
-			     result.extrq_instruction_count,
-			     result.vrsqrtps_instruction_count);
+			::printf("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
+			         ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
+			         ", control=%" PRIu64 ", unrelocatable=%" PRIu64 ", extrq=%" PRIu64 ", vrsqrtps=%" PRIu64 "\n",
+			         Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
+			         result.red_zone_function_count, result.memory_instruction_count,
+			         result.patched_memory_instruction_count, result.short_memory_instruction_count,
+			         result.stack_dependent_memory_instruction_count,
+			         result.control_flow_memory_instruction_count,
+			         result.unrelocatable_memory_instruction_count,
+			         result.extrq_instruction_count,
+			         result.vrsqrtps_instruction_count);
 			reciprocal_sqrt_count = result.reciprocal_sqrt_instruction_count;
 			if (result.extrq_instruction_count != 0) {
-				LOGF("Guest EXTRQ fastpath rewrite: %s, instructions=%" PRIu64 "\n",
-				     Common::PathToString(program->file_name.filename()).c_str(),
-				     result.extrq_instruction_count);
+				::printf("Guest EXTRQ fastpath rewrite: %s, instructions=%" PRIu64 "\n",
+				         Common::PathToString(program->file_name.filename()).c_str(),
+				         result.extrq_instruction_count);
 			}
 			if (result.vrsqrtps_instruction_count != 0) {
-				LOGF("Guest VRSQRTPS fastpath trampoline: %s, instructions=%" PRIu64 "\n",
-				     Common::PathToString(program->file_name.filename()).c_str(),
-				     result.vrsqrtps_instruction_count);
+				::printf("Guest VRSQRTPS fastpath trampoline: %s, instructions=%" PRIu64 "\n",
+				         Common::PathToString(program->file_name.filename()).c_str(),
+				         result.vrsqrtps_instruction_count);
 			}
+			if (rewrite_vrsqrtps || emulate_rsqrt) {
+				const uint64_t fallback_count =
+				    X64InstructionEmulator::PatchReciprocalSquareRoots(segment_addr, segment_size);
+				reciprocal_sqrt_count += fallback_count;
+				if (fallback_count != 0) {
+					::printf("Guest VRSQRTPS fallback #UD sweep: %s, trapped instructions=%" PRIu64 "\n",
+					         Common::PathToString(program->file_name.filename()).c_str(),
+					         fallback_count);
+				}
+				Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
+			}
+			std::fflush(stdout);
 		}
 #else
 		if (emulate_rsqrt) {
@@ -2011,8 +2023,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		}
 #endif
 		if (reciprocal_sqrt_count != 0) {
-			LOGF("Guest VRSQRTPS emulation: %s, instructions=%" PRIu64 "\n",
-			     Common::PathToString(program->file_name.filename()).c_str(), reciprocal_sqrt_count);
+			::printf("Guest VRSQRTPS emulation: %s, instructions=%" PRIu64 "\n",
+			         Common::PathToString(program->file_name.filename()).c_str(), reciprocal_sqrt_count);
+			std::fflush(stdout);
 		}
 	}
 

@@ -7,10 +7,13 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "loader/elf.h"
 #include "loader/redZonePatcher.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
+
+#include <Zydis/Zydis.h>
 
 #include <algorithm>
 #include <array>
@@ -3865,10 +3868,189 @@ void TestSmallFiberStacksAndMigration() {
 }
 #endif
 
+void TestScanEbootInstructions() {
+	const char* test = "ScanEbootInstructions";
+	std::filesystem::path eboot_path = "D:/ps5/PPSA21567 - ASTRO BOT_extracted/eboot.bin";
+	if (!std::filesystem::exists(eboot_path)) {
+		std::printf("[host]    %-48s skipped (eboot.bin not found)\n", test);
+		return;
+	}
+
+	Loader::Elf64 elf;
+	elf.Open(eboot_path);
+	Check(test, elf.IsValid(), "failed to open eboot.bin");
+
+	const auto* ehdr = elf.GetEhdr();
+	const auto* phdr = elf.GetPhdr();
+
+	ZydisDecoder decoder {};
+	Check(test, ZYAN_SUCCESS(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)), "ZydisDecoderInit failed");
+
+	uint64_t eh_frame_addr = 0;
+	uint64_t eh_frame_size = 0;
+	uint64_t eh_frame_offset = 0;
+	for (Loader::Elf64_Half j = 0; j < ehdr->e_phnum; j++) {
+		if (phdr[j].p_type == Loader::PT_GNU_EH_FRAME) {
+			eh_frame_addr = phdr[j].p_vaddr;
+			eh_frame_size = phdr[j].p_filesz;
+			eh_frame_offset = phdr[j].p_offset;
+		}
+	}
+
+	for (Loader::Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+		if (phdr[i].p_memsz != 0 && (phdr[i].p_flags & Loader::PF_X)) {
+			std::vector<uint8_t> buffer(phdr[i].p_filesz);
+			elf.LoadSegment(reinterpret_cast<uint64_t>(buffer.data()), phdr[i].p_offset, phdr[i].p_filesz);
+
+			uint64_t total_vrsqrtps = 0;
+			uint64_t vrsqrtps_128 = 0;
+			uint64_t vrsqrtps_256 = 0;
+			uint64_t vrsqrtps_reg = 0;
+			uint64_t vrsqrtps_mem = 0;
+			uint64_t vrsqrtps_matched_rsqrt = 0;
+			uint64_t total_extrq = 0;
+			uint64_t extrq_imm = 0;
+			uint64_t extrq_reg = 0;
+
+			for (size_t offset = 0; offset < buffer.size();) {
+				ZydisDecodedInstruction instruction {};
+				ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT] {};
+				if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, buffer.data() + offset, buffer.size() - offset, &instruction, operands))) {
+					++offset;
+					continue;
+				}
+
+				if (instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS) {
+					total_vrsqrtps++;
+					if (operands[0].size == 128) vrsqrtps_128++;
+					else if (operands[0].size == 256) vrsqrtps_256++;
+
+					if (operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) vrsqrtps_reg++;
+					else if (operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY) vrsqrtps_mem++;
+
+					if (Loader::X64InstructionEmulator::IsReciprocalSquareRoot(instruction, operands)) {
+						vrsqrtps_matched_rsqrt++;
+					} else {
+						std::printf("  [UNMATCHED VRSQRTPS] offset=0x%zx size=%d op1_type=%d\n",
+						            offset, operands[0].size, operands[1].type);
+					}
+				} else if (instruction.mnemonic == ZYDIS_MNEMONIC_EXTRQ) {
+					total_extrq++;
+					if (operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) extrq_imm++;
+					else if (operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) extrq_reg++;
+				}
+
+				offset += instruction.length;
+			}
+
+			std::printf("\n==================================================\n");
+			std::printf("  EBOOT.BIN EXEC SEGMENT %d (offset=0x%llx, size=%zu MB):\n",
+			            i, (unsigned long long)phdr[i].p_offset, buffer.size() / (1024 * 1024));
+			std::printf("  Total VRSQRTPS: %llu\n", (unsigned long long)total_vrsqrtps);
+			std::printf("    128-bit: %llu, 256-bit: %llu\n", (unsigned long long)vrsqrtps_128, (unsigned long long)vrsqrtps_256);
+			std::printf("    reg-src: %llu, mem-src: %llu\n", (unsigned long long)vrsqrtps_reg, (unsigned long long)vrsqrtps_mem);
+			std::printf("    matched IsReciprocalSquareRoot: %llu\n", (unsigned long long)vrsqrtps_matched_rsqrt);
+			std::printf("  Total EXTRQ: %llu (imm: %llu, reg: %llu)\n", (unsigned long long)total_extrq, (unsigned long long)extrq_imm, (unsigned long long)extrq_reg);
+			std::printf("==================================================\n\n");
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			std::vector<uint8_t> eh_frame_buf(eh_frame_size);
+			elf.LoadSegment(reinterpret_cast<uint64_t>(eh_frame_buf.data()), eh_frame_offset, eh_frame_size);
+			std::vector<uintptr_t> function_starts;
+			Loader::DecodeEhFrameFunctionStarts(reinterpret_cast<uint64_t>(eh_frame_buf.data()), eh_frame_size, &function_starts);
+			std::printf("  Decoded function_starts from eh_frame: %zu\n", function_starts.size());
+			if (!function_starts.empty()) {
+				std::printf("    eh_frame_buf: %p, fs[0]: 0x%llx, fs[1]: 0x%llx, phdr.p_vaddr: 0x%llx\n",
+				            eh_frame_buf.data(), (unsigned long long)function_starts[0],
+				            (unsigned long long)function_starts[1], (unsigned long long)phdr[i].p_vaddr);
+			}
+
+			// In actual game loading, eh_frame is loaded at base_vaddr + eh_frame_p_vaddr,
+			// and segment is loaded at base_vaddr + segment_p_vaddr.
+			// The decoded function_start was: eh_frame_buf.data() + offset_from_eh_frame.
+			// So offset_from_eh_frame = fs - (uintptr_t)eh_frame_buf.data().
+			// Function vaddr in ELF = eh_frame_vaddr + offset_from_eh_frame.
+			for (auto& fs: function_starts) {
+				int64_t diff = static_cast<int64_t>(fs) - reinterpret_cast<int64_t>(eh_frame_buf.data());
+				uint64_t vaddr = eh_frame_addr + diff;
+				fs = reinterpret_cast<uintptr_t>(buffer.data()) + (vaddr - phdr[i].p_vaddr);
+			}
+			if (!function_starts.empty()) {
+				std::printf("    buffer.data: %p, buffer.end: %p, adjusted fs[0]: %p\n",
+				            buffer.data(), buffer.data() + buffer.size(), (void*)function_starts[0]);
+			}
+
+			constexpr size_t TRAMPOLINE_SIZE = 8 * 1024 * 1024;
+			auto* trampoline_mem = VirtualAlloc(nullptr, TRAMPOLINE_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+			Loader::RegisterRedZonePatchModule(buffer.data(), buffer.size(), trampoline_mem, TRAMPOLINE_SIZE);
+
+			const auto patch_res = Loader::PatchGuestInstructions(
+			    reinterpret_cast<uintptr_t>(buffer.data()), buffer.size(), function_starts,
+			    false, false, true, true);
+
+			std::printf("  PatchGuestInstructions result:\n");
+			std::printf("    functions: %llu\n", (unsigned long long)patch_res.function_count);
+			std::printf("    vrsqrtps patched: %llu / %llu\n", (unsigned long long)patch_res.vrsqrtps_instruction_count, (unsigned long long)total_vrsqrtps);
+			std::printf("    extrq patched:    %llu / %llu\n", (unsigned long long)patch_res.extrq_instruction_count, (unsigned long long)total_extrq);
+			std::printf("    unrelocatable:    %llu\n", (unsigned long long)patch_res.unrelocatable_memory_instruction_count);
+
+			uint64_t remaining_vrsqrtps = 0;
+			for (size_t offset = 0; offset < buffer.size();) {
+				ZydisDecodedInstruction instruction {};
+				ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT] {};
+				if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, buffer.data() + offset, buffer.size() - offset, &instruction, operands))) {
+					if (instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS) {
+						remaining_vrsqrtps++;
+						if (remaining_vrsqrtps <= 10) {
+							std::printf("    Remaining unpatched VRSQRTPS at offset 0x%zx (len=%d)\n", offset, instruction.length);
+							if (remaining_vrsqrtps == 1) {
+								// Find function containing offset
+								uintptr_t func_target = reinterpret_cast<uintptr_t>(buffer.data()) + offset;
+								auto it = std::upper_bound(function_starts.begin(), function_starts.end(), func_target);
+								size_t f_start_off = 0;
+								size_t f_end_off = 0;
+								if (it != function_starts.begin()) {
+									--it;
+									uintptr_t f_start = *it;
+									uintptr_t f_end = (it + 1 != function_starts.end()) ? *(it + 1) : (reinterpret_cast<uintptr_t>(buffer.data()) + buffer.size());
+									f_start_off = f_start - reinterpret_cast<uintptr_t>(buffer.data());
+									f_end_off = f_end - reinterpret_cast<uintptr_t>(buffer.data());
+									std::printf("      Function for 0x%zx: start=0x%zx end=0x%zx size=%zu\n",
+									            offset, f_start_off, f_end_off, f_end - f_start);
+								} else {
+									std::printf("      NO FUNCTION FOUND FOR 0x%zx in function_starts!\n", offset);
+								}
+							}
+						}
+					}
+					offset += instruction.length;
+				} else {
+					++offset;
+				}
+			}
+			std::printf("    Total unpatched VRSQRTPS still in binary: %llu\n", remaining_vrsqrtps);
+
+			const uint64_t fallback_corrupted = Loader::X64InstructionEmulator::PatchReciprocalSquareRoots(
+			    reinterpret_cast<uint64_t>(buffer.data()), buffer.size());
+			std::printf("    Fallback PatchReciprocalSquareRoots corrupted: %llu instructions\n", fallback_corrupted);
+
+			Loader::UnregisterRedZonePatchModule(buffer.data());
+			VirtualFree(trampoline_mem, 0, MEM_RELEASE);
+#endif
+		}
+	}
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--scan-eboot") == 0) {
+		RunTest(TestScanEbootInstructions);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 #if defined(__x86_64__) || defined(_M_X64)
 	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
 		RunTest(TestSmallFiberStacksAndMigration);
