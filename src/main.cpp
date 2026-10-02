@@ -280,6 +280,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		if (arg == "--rewrite-vrsqrtps" && (i + 1 >= argc || std::string(argv[i + 1]).starts_with("--"))) {
+			options.config.rewrite_vrsqrtps_enabled = true;
+			continue;
+		}
+
 		if (!arg.starts_with("--")) {
 			::printf("game input must be provided with --game\n");
 			return false;
@@ -540,6 +545,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--rewrite-extrq") {
 			if (!ParseBool(value, options.config.rewrite_extrq_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--rewrite-vrsqrtps") {
+			if (!ParseBool(value, options.config.rewrite_vrsqrtps_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

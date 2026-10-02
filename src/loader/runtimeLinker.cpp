@@ -1837,15 +1837,15 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
-	program->mapped_size = program->base_size_aligned + tls_handler_size;
 	const bool host_supports_vrsqrtps = cpuinfo_initialize() && cpuinfo_has_x86_avx();
+	const bool rewrite_vrsqrtps       = Config::RewriteVrsqrtpsEnabled() && host_supports_vrsqrtps;
 	const bool emulate_rsqrt =
-	    Config::AmdCpuEnabled() && !(Config::NativeVrsqrtpsEnabled() && host_supports_vrsqrtps);
+	    Config::AmdCpuEnabled() && !rewrite_vrsqrtps && !(Config::NativeVrsqrtpsEnabled() && host_supports_vrsqrtps);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool         protect_memory_faults   = Config::RedZoneProtectionEnabled();
 	const bool         rewrite_extrq           = Config::RewriteExtrqEnabled();
-	const bool         use_red_zone_protection = protect_memory_faults || emulate_rsqrt || rewrite_extrq;
+	const bool         use_red_zone_protection = protect_memory_faults || emulate_rsqrt || rewrite_extrq || rewrite_vrsqrtps;
 	constexpr uint64_t RED_ZONE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (use_red_zone_protection) {
 		EXIT_IF(RED_ZONE_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
@@ -1978,22 +1978,28 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		if (use_red_zone_protection) {
 			const auto result =
 			    PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                           protect_memory_faults, emulate_rsqrt, rewrite_extrq);
+			                           protect_memory_faults, emulate_rsqrt, rewrite_extrq, rewrite_vrsqrtps);
 			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
-			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 ", extrq=%" PRIu64 "\n",
+			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 ", extrq=%" PRIu64 ", vrsqrtps=%" PRIu64 "\n",
 			     Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
 			     result.red_zone_function_count, result.memory_instruction_count,
 			     result.patched_memory_instruction_count, result.short_memory_instruction_count,
 			     result.stack_dependent_memory_instruction_count,
 			     result.control_flow_memory_instruction_count,
 			     result.unrelocatable_memory_instruction_count,
-			     result.extrq_instruction_count);
+			     result.extrq_instruction_count,
+			     result.vrsqrtps_instruction_count);
 			reciprocal_sqrt_count = result.reciprocal_sqrt_instruction_count;
 			if (result.extrq_instruction_count != 0) {
 				LOGF("Guest EXTRQ fastpath rewrite: %s, instructions=%" PRIu64 "\n",
 				     Common::PathToString(program->file_name.filename()).c_str(),
 				     result.extrq_instruction_count);
+			}
+			if (result.vrsqrtps_instruction_count != 0) {
+				LOGF("Guest VRSQRTPS fastpath trampoline: %s, instructions=%" PRIu64 "\n",
+				     Common::PathToString(program->file_name.filename()).c_str(),
+				     result.vrsqrtps_instruction_count);
 			}
 		}
 #else

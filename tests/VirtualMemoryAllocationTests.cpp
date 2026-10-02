@@ -3548,6 +3548,158 @@ void TestExtrqRewriteSemantics() {
 
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+void TestVrsqrtpsTrampolineSemantics() {
+	const char* test = "VrsqrtpsTrampolineSemantics";
+
+	constexpr uint64_t code_size = 0x4000;
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x906000000, code_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "vrsqrtps_trampoline_test");
+	Check(test, mapping != 0, "failed to allocate instruction test code");
+
+	struct MappingCleanup {
+		uint64_t addr;
+		uint64_t size;
+		~MappingCleanup() {
+			Libs::LibKernel::Memory::FreeGuestMemory(addr, size);
+		}
+	} cleanup {mapping, code_size};
+
+	std::printf("\n========================================================================================\n");
+	std::printf("  VRSQRTPS TRAMPOLINE SEMANTIC VERIFICATION: Trampoline vs ReciprocalSquareRoot Ref\n");
+	std::printf("========================================================================================\n");
+
+	struct TestContextData {
+		alignas(32) uint32_t in_src[8];   // 256-bit YMM
+		alignas(32) uint32_t in_dest[8];  // 256-bit YMM
+		alignas(32) uint32_t out_src[8];  // 256-bit YMM
+		alignas(32) uint32_t out_dest[8]; // 256-bit YMM
+		uint64_t red_zone[16];
+	};
+
+	constexpr uint64_t kRedZoneSentinel = 0xa5a5a5a55a5a5a5aull;
+	constexpr uint32_t kUpperYmmSentinel = 0xfeedface;
+
+	struct RegConfig {
+		const char* name;
+		int dest;
+		int src;
+		std::vector<uint8_t> instruction_bytes;
+	};
+
+	const std::vector<RegConfig> configs = {
+		{"xmm0, xmm1 (separate)", 0, 1, {0xc5, 0xf8, 0x52, 0xc1}},
+		{"xmm1, xmm1 (in-place)", 1, 1, {0xc5, 0xf8, 0x52, 0xc9}},
+		{"xmm10, xmm9 (extended)", 10, 9, {0xc4, 0x41, 0x78, 0x52, 0xd1}},
+	};
+
+	for (const auto& cfg: configs) {
+		Xbyak::CodeGenerator gen(code_size, reinterpret_cast<void*>(mapping));
+
+		for (uint32_t off = 8; off <= 128; off += 8) {
+			gen.mov(gen.rax, kRedZoneSentinel ^ off);
+			gen.mov(gen.qword[gen.rsp - off], gen.rax);
+		}
+
+		gen.vmovups(Xbyak::Ymm(cfg.src), gen.ptr[gen.rdi]);
+		if (cfg.dest != cfg.src) {
+			gen.vmovups(Xbyak::Ymm(cfg.dest), gen.ptr[gen.rdi + 32]);
+		}
+
+		bool ok = Loader::EmulateVrsqrtpsInstruction(cfg.instruction_bytes.data(),
+		                                             cfg.instruction_bytes.size(), gen);
+		Check(test, ok, "EmulateVrsqrtpsInstruction failed for config");
+
+		gen.vmovups(gen.ptr[gen.rdi + 64], Xbyak::Ymm(cfg.src));
+		gen.vmovups(gen.ptr[gen.rdi + 96], Xbyak::Ymm(cfg.dest));
+		gen.vzeroupper();
+
+		for (uint32_t off = 8; off <= 128; off += 8) {
+			gen.mov(gen.rax, gen.qword[gen.rsp - off]);
+			gen.mov(gen.qword[gen.rdi + 128 + off - 8], gen.rax);
+		}
+		gen.ret();
+		Common::VirtualMemory::FlushInstructionCache(mapping, gen.getSize());
+
+		using Func = void(KYTY_SYSV_ABI*)(TestContextData*);
+		const auto func = reinterpret_cast<Func>(mapping);
+
+		TestContextData data {};
+
+		const std::vector<std::array<uint32_t, 4>> special_cases = {
+			{0x00000000, 0x80000000, 0x00000001, 0x80000001}, // +0, -0, +denorm, -denorm
+			{0x7f800000, 0xff800000, 0xbf800000, 0x7fc12345}, // +inf, -inf, -1.0, qNaN
+			{0x7f812345, 0xff812345, 0x40800000, 0x40000000}, // sNaN+, sNaN-, 4.0, 2.0
+			{0x00800000, 0x7f7fffff, 0x3f800000, 0x41800000}, // min normal, max finite, 1.0, 16.0
+			{0x3e800000, 0x3f000000, 0x3f800000, 0x42000000}, // 0.25, 0.5, 1.0, 32.0
+		};
+
+		for (const auto& vec: special_cases) {
+			std::copy_n(vec.begin(), 4, data.in_src);
+			std::fill_n(data.in_src + 4, 4, kUpperYmmSentinel);
+			std::fill_n(data.in_dest, 8, kUpperYmmSentinel);
+			std::memset(data.out_src, 0, sizeof(data.out_src));
+			std::memset(data.out_dest, 0, sizeof(data.out_dest));
+			std::memset(data.red_zone, 0, sizeof(data.red_zone));
+
+			func(&data);
+
+			for (size_t lane = 0; lane < 4; ++lane) {
+				const uint32_t expected = Loader::X64InstructionEmulator::ReciprocalSquareRoot(data.in_src[lane]);
+				Check(test, data.out_dest[lane] == expected, "VRSQRTPS special case output mismatch");
+			}
+
+			for (size_t lane = 4; lane < 8; ++lane) {
+				Check(test, data.out_dest[lane] == 0, "upper YMM lanes of destination must be zeroed");
+			}
+
+			if (cfg.dest != cfg.src) {
+				for (size_t lane = 0; lane < 8; ++lane) {
+					Check(test, data.out_src[lane] == data.in_src[lane], "source YMM was corrupted");
+				}
+			}
+
+			for (uint32_t i = 0; i < 16; ++i) {
+				const uint32_t off = (i + 1) * 8;
+				Check(test, data.red_zone[i] == (kRedZoneSentinel ^ off), "guest red zone was corrupted");
+			}
+		}
+
+		const uint32_t saved_mxcsr = _mm_getcsr();
+		for (uint32_t controls = 0; controls < 8; ++controls) {
+			const uint32_t mxcsr = 0x1fa1u | ((controls & 3u) << 13u) | ((controls & 4u) << 4u);
+			_mm_setcsr(mxcsr);
+			func(&data);
+			const auto result_mxcsr = _mm_getcsr();
+			_mm_setcsr(saved_mxcsr);
+			Check(test, result_mxcsr == mxcsr, "VRSQRTPS trampoline modified MXCSR flags or controls");
+		}
+
+		uint64_t rng = 0x853c49e6748fea9bull;
+		size_t match_count = 0;
+		for (size_t iter = 0; iter < 25000; ++iter) {
+			for (size_t lane = 0; lane < 4; ++lane) {
+				rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+				data.in_src[lane] = static_cast<uint32_t>(rng);
+			}
+			std::fill_n(data.in_src + 4, 4, kUpperYmmSentinel);
+			std::fill_n(data.in_dest, 8, kUpperYmmSentinel);
+
+			func(&data);
+
+			for (size_t lane = 0; lane < 4; ++lane) {
+				const uint32_t expected = Loader::X64InstructionEmulator::ReciprocalSquareRoot(data.in_src[lane]);
+				Check(test, data.out_dest[lane] == expected, "randomized float VRSQRTPS mismatch");
+				++match_count;
+			}
+		}
+
+		std::printf("  [PASS] %-24s: %zu / %zu (100.0%%) bit-exact matches against reference.\n",
+		            cfg.name, match_count, match_count);
+	}
+	std::printf("========================================================================================\n\n");
+	std::printf("[host]    %-48s ok\n", test);
+}
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -3733,6 +3885,10 @@ int main(int argc, char** argv) {
 		RunTest(TestExtrqRewriteSemantics);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
+	if (argc == 2 && std::strcmp(argv[1], "--vrsqrtps-trampoline") == 0) {
+		RunTest(TestVrsqrtpsTrampolineSemantics);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 #endif
 	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
 		RunTest(TestPackedReciprocalSquareRoot);
@@ -3749,6 +3905,9 @@ int main(int argc, char** argv) {
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestVrsqrtpsTrampolineSemantics);
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);

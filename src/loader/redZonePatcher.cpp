@@ -141,6 +141,7 @@ struct InstructionRewrite {
 	bool protect_red_zone {};
 	bool protected_indirect_call {};
 	bool emulate_extrq {};
+	bool emulate_vrsqrtps {};
 };
 
 bool IsStackPointerRegister(ZydisRegister reg) {
@@ -874,6 +875,184 @@ bool GenerateEmulatedExtrq(const ZydisDecodedInstruction& instruction,
 	return false;
 }
 
+bool GenerateEmulatedVrsqrtps(const ZydisDecodedInstruction& instruction,
+                              const ZydisDecodedOperand*     operands,
+                              Xbyak::CodeGenerator&          generator) {
+	if (instruction.mnemonic != ZYDIS_MNEMONIC_VRSQRTPS ||
+	    instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_VEX) {
+		return false;
+	}
+	if (operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    operands[0].reg.value < ZYDIS_REGISTER_XMM0 ||
+	    operands[0].reg.value > ZYDIS_REGISTER_XMM15) {
+		return false;
+	}
+	if (operands[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+	    operands[1].reg.value < ZYDIS_REGISTER_XMM0 ||
+	    operands[1].reg.value > ZYDIS_REGISTER_XMM15) {
+		return false;
+	}
+
+	const int dest_idx = operands[0].reg.value - ZYDIS_REGISTER_XMM0;
+	const int src_idx  = operands[1].reg.value - ZYDIS_REGISTER_XMM0;
+
+	int scratch[4] = {-1, -1, -1, -1};
+	int count = 0;
+	for (int i = 0; i < 16; ++i) {
+		if (i != dest_idx && i != src_idx) {
+			scratch[count++] = i;
+			if (count == 4) break;
+		}
+	}
+	if (count < 4) {
+		return false;
+	}
+
+	const Xbyak::Ymm s0(scratch[0]);
+	const Xbyak::Ymm s1(scratch[1]);
+	const Xbyak::Ymm s2(scratch[2]);
+	const Xbyak::Ymm s3(scratch[3]);
+
+	const Xbyak::Xmm s0_xmm(scratch[0]);
+	const Xbyak::Xmm s1_xmm(scratch[1]);
+	const Xbyak::Xmm s2_xmm(scratch[2]);
+	const Xbyak::Xmm s3_xmm(scratch[3]);
+
+	const Xbyak::Xmm dest_xmm(dest_idx);
+	const Xbyak::Xmm src_xmm(src_idx);
+
+	// Frame layout below RSP:
+	// [rsp + 0..31]   : saved s0 (32 bytes)
+	// [rsp + 32..63]  : saved s1 (32 bytes)
+	// [rsp + 64..95]  : saved s2 (32 bytes)
+	// [rsp + 96..127] : saved s3 (32 bytes)
+	// [rsp + 128..131]: saved MXCSR (4 bytes)
+	// [rsp + 132..135]: 0x1f80 template (4 bytes)
+	// [rsp + 144..159]: is_zero_or_denorm mask (16 bytes)
+	// [rsp + 160..175]: val_zero_or_denorm (16 bytes)
+	// [rsp + 176..191]: is_nan mask (16 bytes)
+	// [rsp + 192..207]: val_nan (16 bytes)
+	// [rsp + 208..223]: is_neg mask (16 bytes)
+	// [rsp + 224..239]: is_pos_inf mask (16 bytes)
+	// [rsp + 256..383]: 128-byte guest red zone (untouched!)
+	constexpr size_t FrameSize = 384;
+
+	generator.lea(rsp, ptr[rsp - FrameSize]);
+
+	// Save scratch registers
+	generator.vmovups(ptr[rsp + 0], s0);
+	generator.vmovups(ptr[rsp + 32], s1);
+	generator.vmovups(ptr[rsp + 64], s2);
+	generator.vmovups(ptr[rsp + 96], s3);
+
+	// Save MXCSR and set safe MXCSR (0x1f80: all exceptions masked, round to nearest)
+	generator.stmxcsr(ptr[rsp + 128]);
+	generator.mov(dword[rsp + 132], 0x1f80);
+	generator.ldmxcsr(ptr[rsp + 132]);
+
+	// exp_mask = 0x7f800000
+	generator.vpcmpeqd(s0_xmm, s0_xmm, s0_xmm);
+	generator.vpsrld(s0_xmm, s0_xmm, 24);
+	generator.vpslld(s0_xmm, s0_xmm, 23);
+
+	// sign_mask = 0x80000000
+	generator.vpslld(s1_xmm, s0_xmm, 8);
+
+	// 1. Zero / Denormal: (src & exp_mask) == 0
+	generator.vandps(s2_xmm, src_xmm, s0_xmm);
+	generator.vpxor(s3_xmm, s3_xmm, s3_xmm);
+	generator.vpcmpeqd(s2_xmm, s2_xmm, s3_xmm);
+	generator.vmovups(ptr[rsp + 144], s2_xmm); // [rsp + 144] = is_zero_denorm_mask
+
+	// Value for zero/denorm: (src & sign_mask) | exp_mask
+	generator.vandps(s2_xmm, src_xmm, s1_xmm);
+	generator.vorps(s2_xmm, s2_xmm, s0_xmm);
+	generator.vmovups(ptr[rsp + 160], s2_xmm); // [rsp + 160] = val_zero_denorm
+
+	// 2. Positive Infinity: src == exp_mask
+	generator.vpcmpeqd(s2_xmm, src_xmm, s0_xmm);
+	generator.vmovups(ptr[rsp + 224], s2_xmm); // [rsp + 224] = is_pos_inf_mask
+
+	// 3. Negative (normal or -inf): (src & sign_mask) != 0 AND NOT zero_or_denorm
+	generator.vandps(s2_xmm, src_xmm, s1_xmm);
+	generator.vpcmpeqd(s2_xmm, s2_xmm, s1_xmm);
+	generator.vmovups(s3_xmm, ptr[rsp + 144]);
+	generator.vpandn(s2_xmm, s3_xmm, s2_xmm);
+	generator.vmovups(ptr[rsp + 208], s2_xmm); // [rsp + 208] = is_neg_mask
+
+	// 4. NaN: magnitude > exp_mask
+	generator.vpcmpeqd(s2_xmm, s2_xmm, s2_xmm);
+	generator.vpsrld(s2_xmm, s2_xmm, 1);       // 0x7fffffff (mag_mask)
+	generator.vandps(s2_xmm, src_xmm, s2_xmm); // magnitude
+	generator.vpcmpgtd(s2_xmm, s2_xmm, s0_xmm);
+	generator.vmovups(ptr[rsp + 176], s2_xmm); // [rsp + 176] = is_nan_mask
+
+	// Value for NaN: src | 0x00400000
+	generator.vpcmpeqd(s3_xmm, s3_xmm, s3_xmm);
+	generator.vpsrld(s3_xmm, s3_xmm, 31);
+	generator.vpslld(s3_xmm, s3_xmm, 22);       // 0x00400000 (qnan_bit)
+	generator.vorps(s3_xmm, src_xmm, s3_xmm);
+	generator.vmovups(ptr[rsp + 192], s3_xmm); // [rsp + 192] = val_nan
+
+	// 5. Build safe_src:
+	generator.vmovups(s0_xmm, ptr[rsp + 144]);       // is_zero_denorm
+	generator.vorps(s0_xmm, s0_xmm, ptr[rsp + 176]); // | is_nan
+	generator.vorps(s0_xmm, s0_xmm, ptr[rsp + 208]); // | is_neg
+	generator.vorps(s0_xmm, s0_xmm, ptr[rsp + 224]); // | is_pos_inf (s0 = any_special_mask)
+
+	// 1.0f in s1_xmm:
+	generator.vpcmpeqd(s1_xmm, s1_xmm, s1_xmm);
+	generator.vpsrld(s1_xmm, s1_xmm, 25);
+	generator.vpslld(s1_xmm, s1_xmm, 23);            // s1_xmm = 1.0f
+
+	// Blend: if any_special_mask (s0_xmm) is set, choose 1.0f (s1_xmm), else keep src_xmm:
+	generator.vblendvps(s2_xmm, src_xmm, s1_xmm, s0_xmm); // s2_xmm = safe_src
+
+	// 6. Double-precision math on safe_src:
+	generator.vcvtps2pd(s0, s2_xmm);                 // s0 = safe_src as 4 doubles
+	generator.vsqrtpd(s2, s0);                       // s2 = sqrt(safe_src)
+	generator.vcvtps2pd(s3, s1_xmm);                 // s3 = 4 doubles of 1.0
+	generator.vdivpd(s0, s3, s2);                    // s0 = 1.0 / sqrt(safe_src)
+	generator.vcvtpd2ps(s1_xmm, s0);                 // s1_xmm = normal positive results!
+
+	// 7. Blend in special cases:
+	// pos_inf -> 0.0f
+	generator.vpxor(s0_xmm, s0_xmm, s0_xmm);         // s0 = 0.0f
+	generator.vmovups(s2_xmm, ptr[rsp + 224]);       // mask = is_pos_inf
+	generator.vblendvps(s1_xmm, s1_xmm, s0_xmm, s2_xmm);
+
+	// is_neg -> 0xffc00000
+	generator.vpcmpeqd(s0_xmm, s0_xmm, s0_xmm);
+	generator.vpslld(s0_xmm, s0_xmm, 22);            // s0 = 0xffc00000
+	generator.vmovups(s2_xmm, ptr[rsp + 208]);       // mask = is_neg
+	generator.vblendvps(s1_xmm, s1_xmm, s0_xmm, s2_xmm);
+
+	// is_nan -> val_nan
+	generator.vmovups(s2_xmm, ptr[rsp + 176]);       // mask = is_nan
+	generator.vblendvps(s1_xmm, s1_xmm, ptr[rsp + 192], s2_xmm);
+
+	// is_zero_denorm -> val_zero_denorm
+	generator.vmovups(s2_xmm, ptr[rsp + 144]);       // mask = is_zero_denorm
+	generator.vblendvps(s1_xmm, s1_xmm, ptr[rsp + 160], s2_xmm);
+
+	// Store final result to destination (hardware zeros upper 128 bits of ymm_dest)
+	generator.vmovups(dest_xmm, s1_xmm);
+
+	// 8. Restore MXCSR
+	generator.ldmxcsr(ptr[rsp + 128]);
+
+	// 9. Restore scratch registers
+	generator.vmovups(s0, ptr[rsp + 0]);
+	generator.vmovups(s1, ptr[rsp + 32]);
+	generator.vmovups(s2, ptr[rsp + 64]);
+	generator.vmovups(s3, ptr[rsp + 96]);
+
+	// 10. Restore stack
+	generator.lea(rsp, ptr[rsp + FrameSize]);
+
+	return true;
+}
+
 void CollectExtrqInstructions(const DecodedFunction&                   function,
                               std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                               RedZonePatchResult&                     result) {
@@ -883,6 +1062,18 @@ void CollectExtrqInstructions(const DecodedFunction&                   function,
 		}
 		++result.extrq_instruction_count;
 		rewrite_sites[address].emulate_extrq = true;
+	}
+}
+
+void CollectVrsqrtpsInstructions(const DecodedFunction&                   function,
+                                 std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                                 RedZonePatchResult&                     result) {
+	for (const auto& [address, decoded]: function.instructions) {
+		if (X64InstructionEmulator::IsReciprocalSquareRoot(decoded.instruction,
+		                                                    decoded.operands.data())) {
+			++result.vrsqrtps_instruction_count;
+			rewrite_sites[address].emulate_vrsqrtps = true;
+		}
 	}
 }
 
@@ -992,14 +1183,23 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 				    rewrite != rewrite_sites.end() && rewrite->second.protected_indirect_call;
 				const bool emulate_extrq =
 				    rewrite != rewrite_sites.end() && rewrite->second.emulate_extrq;
+				const bool emulate_vrsqrtps =
+				    rewrite != rewrite_sites.end() && rewrite->second.emulate_vrsqrtps;
 				const bool protect_red_zone = rewrite != rewrite_sites.end() &&
 				                              rewrite->second.protect_red_zone &&
 				                              !protected_indirect_call &&
-				                              !emulate_extrq;
+				                              !emulate_extrq &&
+				                              !emulate_vrsqrtps;
 				if (protect_red_zone) {
 					module->trampoline_gen.lea(rsp, ptr[rsp - GuestRedZoneSize]);
 				}
-				if (emulate_extrq) {
+				if (emulate_vrsqrtps) {
+					if (!GenerateEmulatedVrsqrtps(decoded->instruction, decoded->operands.data(),
+					                              module->trampoline_gen)) {
+						module->trampoline_gen.setSize(trampoline_offset);
+						return std::nullopt;
+					}
+				} else if (emulate_extrq) {
 					if (!GenerateEmulatedExtrq(decoded->instruction, decoded->operands.data(),
 					                           module->trampoline_gen)) {
 						module->trampoline_gen.setSize(trampoline_offset);
@@ -1413,10 +1613,24 @@ bool EmulateExtrqInstruction(const void* instruction_bytes, size_t instruction_l
 	return GenerateEmulatedExtrq(instruction, operands.data(), generator);
 }
 
+bool EmulateVrsqrtpsInstruction(const void* instruction_bytes, size_t instruction_length,
+                               ::Xbyak::CodeGenerator& generator) {
+	ZydisDecodedInstruction instruction {};
+	std::array<ZydisDecodedOperand, ZYDIS_MAX_OPERAND_COUNT> operands {};
+	const auto status = ZydisDecoderDecodeFull(&GetDecoder(), instruction_bytes,
+	                                           instruction_length, &instruction,
+	                                           operands.data());
+	if (!ZYAN_SUCCESS(status)) {
+		return false;
+	}
+	return GenerateEmulatedVrsqrtps(instruction, operands.data(), generator);
+}
+
 RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
                                           std::span<const uintptr_t> function_starts,
                                           bool protect_memory, bool emulate_rsqrt,
-                                          bool rewrite_extrq) {
+                                          bool rewrite_extrq,
+                                          bool rewrite_vrsqrtps) {
 	RedZonePatchResult result {};
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
 	if (module == nullptr || function_starts.empty()) {
@@ -1457,13 +1671,16 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 			++result.red_zone_function_count;
 			result.indirect_red_zone_function_count += function.has_indirect_branch;
 		}
+		if (rewrite_vrsqrtps) {
+			CollectVrsqrtpsInstructions(function, rewrite_sites, result);
+		}
 		if (rewrite_extrq) {
 			CollectExtrqInstructions(function, rewrite_sites, result);
 		}
 		if (protect_memory) {
 			CollectRedZoneMemoryInstructions(function, rewrite_sites, result);
 		}
-		if (emulate_rsqrt) {
+		if (emulate_rsqrt && !rewrite_vrsqrtps) {
 			CollectReciprocalSquareRoots(function, rewrite_sites, reciprocal_sqrt_sites);
 		}
 		if (!rewrite_sites.empty()) {
@@ -1475,7 +1692,7 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 	const auto trampoline_addr =
 	    reinterpret_cast<u64>(module->trampoline_gen.getCode()) + trampoline_begin;
 	const auto trampoline_size = module->trampoline_gen.getSize() - trampoline_begin;
-	if (emulate_rsqrt) {
+	if (emulate_rsqrt && !rewrite_vrsqrtps) {
 		result.reciprocal_sqrt_instruction_count = ApplyReciprocalSquareRootPatches(
 		    *module, reciprocal_sqrt_sites, trampoline_addr, trampoline_size);
 	}
@@ -1488,7 +1705,7 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 
 #else
 
-RedZonePatchResult PatchGuestInstructions(u64, u64, std::span<const uintptr_t>, bool, bool, bool) {
+RedZonePatchResult PatchGuestInstructions(u64, u64, std::span<const uintptr_t>, bool, bool, bool, bool) {
 	return {};
 }
 

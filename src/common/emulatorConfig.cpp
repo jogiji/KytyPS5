@@ -262,6 +262,10 @@ bool RewriteExtrqEnabled() {
 	return g_config->rewrite_extrq_enabled;
 }
 
+bool RewriteVrsqrtpsEnabled() {
+	return g_config->rewrite_vrsqrtps_enabled;
+}
+
 const Keymap& GetKeymap() {
 	return g_config->keymap;
 }

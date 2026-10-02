@@ -28,6 +28,7 @@ struct RedZonePatchResult {
 	uint64_t indirect_red_zone_function_count         = 0;
 	uint64_t reciprocal_sqrt_instruction_count        = 0;
 	uint64_t extrq_instruction_count                  = 0;
+	uint64_t vrsqrtps_instruction_count               = 0;
 };
 
 void RegisterRedZonePatchModule(void* module_ptr, uint64_t module_size, void* trampoline_area_ptr,
@@ -38,7 +39,8 @@ void UnregisterRedZonePatchModule(void* module_ptr);
 RedZonePatchResult PatchGuestInstructions(uint64_t segment_addr, uint64_t segment_size,
                                           std::span<const uintptr_t> function_starts,
                                           bool protect_memory, bool emulate_rsqrt,
-                                          bool rewrite_extrq = false);
+                                          bool rewrite_extrq = false,
+                                          bool rewrite_vrsqrtps = false);
 
 bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
                                  std::vector<uintptr_t>* function_starts);
@@ -46,6 +48,8 @@ bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_fram
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool EmulateExtrqInstruction(const void* instruction_bytes, size_t instruction_length,
                              ::Xbyak::CodeGenerator& generator);
+bool EmulateVrsqrtpsInstruction(const void* instruction_bytes, size_t instruction_length,
+                               ::Xbyak::CodeGenerator& generator);
 #endif
 
 } // namespace Loader

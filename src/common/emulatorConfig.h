@@ -94,6 +94,7 @@ struct ConfigOptions {
 #endif
 	bool                   native_vrsqrtps_enabled     = false;
 	bool                   rewrite_extrq_enabled       = false;
+	bool                   rewrite_vrsqrtps_enabled    = false;
 	Keymap keymap;
 };
 
@@ -190,6 +191,7 @@ bool RedZoneProtectionEnabled();
 #endif
 bool NativeVrsqrtpsEnabled();
 bool RewriteExtrqEnabled();
+bool RewriteVrsqrtpsEnabled();
 
 const Keymap& GetKeymap();
 
