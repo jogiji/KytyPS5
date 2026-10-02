@@ -105,8 +105,7 @@ TranslateJournalPlans(std::vector<ShaderPrecompile::PermutationRecord> &records)
       continue;
     }
     auto translated = TranslateProgram(record.code, options);
-    if (translated.skip_dispatch ||
-        !translated.program.resource_tracking_complete) {
+    if (!translated.program.resource_tracking_complete) {
       continue;
     }
     plans.push_back({.stage = record.stage,
@@ -268,9 +267,6 @@ CompileJournalRecord(ShaderPrecompile::PermutationRecord &record,
       },
       record.info);
   auto translated = TranslateProgram(record.code, options);
-  if (translated.skip_dispatch) {
-    return std::nullopt;
-  }
   return CompileProgram(std::move(translated), options, record.specialization,
                         record.push_data_start_dword);
 }
@@ -1345,8 +1341,7 @@ void RunJournalDisasm(const char *journal_path, std::span<char *const> hashes) {
                 record.wave_size, record.code.size());
     auto translated = TranslateProgram(record.code, options);
     std::printf("--- decoded\n%s", translated.decoded_dump.c_str());
-    if (translated.skip_dispatch ||
-        !translated.program.resource_tracking_complete ||
+    if (!translated.program.resource_tracking_complete ||
         translated.program.info.buffers.size() !=
             record.specialization.buffers.size() ||
         translated.program.info.images.size() >

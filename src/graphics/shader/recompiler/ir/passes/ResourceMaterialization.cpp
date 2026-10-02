@@ -160,31 +160,12 @@ bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> val
 
 bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<ReadCapture*>(userdata);
-	if (!capture.source.read_memory(capture.source.userdata, address, values)) {
-		return false;
+	if (capture.source.read_memory != nullptr) {
+		if (!capture.source.read_memory(capture.source.userdata, address, values)) return false;
+	} else {
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
 	capture.ranges.emplace_back(address, values.size_bytes());
-	return true;
-}
-
-bool WrittenBuffersDisjoint(const ResourcePlan& program, const ResourceSnapshot& snapshot,
-                            std::span<const std::pair<uint64_t, uint64_t>> reads) {
-	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
-		if (!program.info.buffers[i].written) continue;
-		ShaderBufferResource buffer;
-		if (!DecodeBufferDescriptor(snapshot.buffers[i], buffer)) return false;
-		const auto base = buffer.Base48();
-		const auto size = buffer.GetSize();
-		if (size == 0u) continue;
-		if (size - 1u > AddressMask - base) return false;
-		for (const auto [address, bytes]: reads) {
-			if (bytes == 0u) continue;
-			if (address > AddressMask || bytes - 1u > AddressMask - address ||
-			    (address <= base ? base - address < bytes : address - base < size)) {
-				return false;
-			}
-		}
-	}
 	return true;
 }
 
@@ -665,9 +646,10 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 	return true;
 }
 
-static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
-	// Any shader write may alias a scalar predicate read, including on a later loop visit.
-	if (program.blocks.size() != program.block_info.size() || HasShaderMemoryWrites(program)) {
+template <typename Predicate>
+static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, const Predicate& predicate) {
+	// The renderer checks captured scalar reads against final buffer and image write ranges.
+	if (program.blocks.size() != program.block_info.size() || program.has_address_writes) {
 		return {};
 	}
 	std::unordered_map<uint32_t, uint32_t> indices;
@@ -686,9 +668,7 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 			case CFG::TerminatorKind::Branch: successors.push_back(terminator.true_block); break;
 			case CFG::TerminatorKind::ConditionalBranch:
 				successors = {terminator.true_block, terminator.false_block};
-				if (ValidateRuntimeValue(program, info.condition, RuntimeValueType::Integer)) {
-					block.condition = info.condition;
-				}
+				block.condition = info.condition;
 				break;
 			case CFG::TerminatorKind::IndirectBranch:
 				successors = terminator.indirect_targets;
@@ -705,13 +685,17 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 		}
 		for (const auto& inst: *program.blocks[i]) {
 			const auto op     = inst.GetOpcode();
+			if (op == ValueOpcode::ReadConst) {
+				block.srt_reads.push_back(inst.Arg(1).Resolve().U32());
+				continue;
+			}
 			const auto buffer = BufferAccessOf(op);
 			const auto image  = ImageOpcodeInfoOf(op);
 			if (buffer == BufferAccess::None && image.access == ImageAccess::None) {
 				continue;
 			}
 			const auto& memory = program.memory_info.at(inst.Flags<MemoryFlags>().index);
-			if (memory.planning_only) {
+			if (memory.planning_only || memory.kind == ResourceKind::IndirectBuffer) {
 				continue;
 			}
 			if (buffer != BufferAccess::None) {
@@ -727,6 +711,7 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 		block.sources.erase(std::unique(block.sources.begin(), block.sources.end()),
 		                    block.sources.end());
 	}
+	for (auto& block: blocks) block.condition = predicate(block.condition);
 	if (std::ranges::none_of(
 	        blocks, [](const ResourceBlock& block) { return !block.condition.IsEmpty(); })) {
 		return {};
@@ -941,10 +926,38 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
-	plan.control_flow = ResourceControlFlow(program);
-	for (auto& block: plan.control_flow) {
-		block.condition = Clone(block.condition);
-	}
+	// A proven uniform factor can decide a branch even when its other lanes are unknown.
+	// Keep only that Boolean structure, never the varying shader dependency graph.
+	Value unknown;
+	std::function<Value(Value)> ClonePredicate = [&](Value value) -> Value {
+		value = value.Resolve();
+		if (value.IsEmpty()) return {};
+		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) return Clone(value);
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return {};
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::ConditionRef || op == ValueOpcode::LogicalNot) {
+			const auto operand = ClonePredicate(inst->Arg(0));
+			if (operand.IsEmpty() || op == ValueOpcode::ConditionRef) return operand;
+			auto& node = plan.value_storage.emplace_back(op);
+			node.SetArg(0, operand);
+			return Value(&node);
+		}
+		if (op != ValueOpcode::LogicalAnd && op != ValueOpcode::LogicalOr) return {};
+		auto left = ClonePredicate(inst->Arg(0));
+		auto right = ClonePredicate(inst->Arg(1));
+		if (left.IsEmpty() && right.IsEmpty()) return {};
+		if (left.IsEmpty() || right.IsEmpty()) {
+			if (unknown.IsEmpty()) unknown = Value(&plan.value_storage.emplace_back(ValueOpcode::UndefU1));
+			if (left.IsEmpty()) left = unknown;
+			if (right.IsEmpty()) right = unknown;
+		}
+		auto& node = plan.value_storage.emplace_back(op);
+		node.SetArg(0, left);
+		node.SetArg(1, right);
+		return Value(&node);
+	};
+	plan.control_flow = ResourceControlFlow(program, ClonePredicate);
 	plan.uniform_fill = AnalyzeUniformFill(program);
 	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
 		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
@@ -963,12 +976,15 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->table_source),
 		                   plan.clean_flat_slots);
 	}
-	if (masked_image) {
-		plan.resource_tracking_complete &= !program.has_address_writes &&
-		    !std::ranges::any_of(plan.info.images, &ImageResource::written);
-		plan.capture_specialization_reads =
-		    std::ranges::any_of(plan.info.buffers, &BufferResource::written);
+	plan.capture_specialization_reads = masked_image || !plan.control_flow.empty();
+	// Writable descriptor addresses must come from clean backing for the alias proof.
+	for (const auto& buffer: plan.info.buffers) {
+		if (buffer.written) MarkCleanFlatSlots(plan, Source(plan, buffer.source), plan.clean_flat_slots);
 	}
+	for (const auto& image: plan.info.images) {
+		if (image.written) MarkCleanFlatSlots(plan, Source(plan, image.source), plan.clean_flat_slots);
+	}
+	if (masked_image) plan.resource_tracking_complete &= !program.has_address_writes;
 	return plan;
 }
 
@@ -1191,12 +1207,10 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
                  const SrtRuntime& observed, bool capture_reads, typename Roots::Walker& clean,
                  typename Roots::Walker& walker, ResourceSnapshot& snapshot,
                  ResourceSpecialization& specialization, MaterializationMemo* memo) {
-	auto& reads = program.ThreadScratch().specialization_reads;
-	// The ordinary walker sends conditions that are not direct to its strict walker.
-	const auto active = walker.FindActiveSources();
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return false;
 	}
+	const auto active = walker.FindActiveSources();
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
 	const auto words = fill.fill.words;
@@ -1223,12 +1237,12 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 			memo->valid = false;
 		}
 	}
-	const auto evaluate = [&](uint32_t source, DescriptorValue& value) {
+	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
 		if (source >= program.descriptor_sources.size()) {
 			return false;
 		}
 		if (active.empty() || active[source]) {
-			return walker.EvaluateDescriptor(source, value);
+			return (written ? clean : walker).EvaluateDescriptor(source, value);
 		}
 		value = {};
 		value.dword_count = program.descriptor_sources[source].dword_count;
@@ -1236,17 +1250,9 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 	};
 	snapshot.buffers.resize(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
-		if (!evaluate(program.info.buffers[i].source, snapshot.buffers[i])) {
+		if (!evaluate(program.info.buffers[i].source, snapshot.buffers[i],
+		              program.info.buffers[i].written)) {
 			return false;
-		}
-	}
-	if (capture_reads) {
-		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
-			const auto& buffer = program.info.buffers[i];
-			if (!buffer.written || (!active.empty() && !active[buffer.source])) continue;
-			DescriptorValue strict;
-			if (!clean.EvaluateDescriptor(buffer.source, strict) ||
-			    strict != snapshot.buffers[i]) return false;
 		}
 	}
 	snapshot.images.resize(program.info.images.size());
@@ -1284,7 +1290,7 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 				return false;
 			}
 		} else {
-			if (!evaluate(image.source, snapshot.images[i])) {
+			if (!evaluate(image.source, snapshot.images[i], image.written)) {
 				return false;
 			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
@@ -1298,7 +1304,6 @@ bool Materialize(const ResourcePlan& program, const Roots& roots, const SrtRunti
 			return false;
 		}
 	}
-	if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads)) return false;
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	if (!BuildResourceSpecialization(program, snapshot, specialization)) {
 		return false;

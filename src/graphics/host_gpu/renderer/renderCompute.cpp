@@ -260,10 +260,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		DrainStats::SlowLookupTimer compile_timer(DrainStats::Kind::ShaderCompile);
 		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}();
-	if (!compute_program) {
-		// Temporary until RT is implemented.
-		return;
-	}
 	if (DebugSkipShader(input_info.stage.program->shader_hash, DebugShaderKind::Compute))
 	    [[unlikely]] {
 		return;
@@ -276,15 +272,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+	if (resources.specialization_reads.empty() &&
+	    (TryConsumeComputeMetaClear(input_info, buffer) ||
+	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
+	                                 thread_group_z, mode))) {
 		ResetBindings();
 		return;
 	}
-	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-	                                thread_group_z, mode)) {
-		ResetBindings();
-		return;
-	}
+
 	const bool large_workgroup =
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const bool                   has_sampler = !program.info.samplers.empty();
@@ -449,10 +444,6 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return m_context.GetPipelineCache().GetComputeProgram(
 		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	}();
-	if (!compute_program) {
-		// Temporary until RT is implemented.
-		return;
-	}
 	if (DebugSkipShader(input_info.stage.program->shader_hash, DebugShaderKind::Compute))
 	    [[unlikely]] {
 		return;

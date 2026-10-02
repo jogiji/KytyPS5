@@ -155,6 +155,15 @@ uint32_t EmitOwnWaveHalfWord(EmitterState& state, uint32_t ballot) {
 }
 
 uint32_t EmitLaunchedLaneAtOrBelow(EmitterState& state, uint32_t lane) {
+	const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info);
+	if (workgroup != nullptr) {
+		const uint32_t total_threads = workgroup->threads_num[0] *
+		                               std::max(workgroup->threads_num[1], 1u) *
+		                               std::max(workgroup->threads_num[2], 1u);
+		if (total_threads != 0 && total_threads % state.program.wave_size == 0) {
+			return lane;
+		}
+	}
 	const auto ballot = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
 	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
@@ -183,6 +192,37 @@ uint32_t EmitLaunchedLaneAtOrBelow(EmitterState& state, uint32_t lane) {
 		state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), high_hit, high_below,
 		                          ConstantU32(state, 0));
 		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), use_high, in_high, high_hit);
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), low_word, in_high, low,
+		                          EmitBinaryU32(state, spv::OpBitwiseAnd, low, below));
+		word = state.builder.AllocateId();
+		base = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), word, use_high, high_below,
+		                          low_word);
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), base, use_high,
+		                          ConstantU32(state, 32), ConstantU32(state, 0));
+	} else if (state.program.wave_size == 64u && state.lane_count == 2) {
+		const auto in_high = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpINotEqual, TypeBool(state), in_high,
+		    EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 32)),
+		    ConstantU32(state, 0));
+		uint32_t high_launched = ConstantBool(state, true);
+		if (workgroup != nullptr) {
+			const uint32_t total_threads = workgroup->threads_num[0] *
+			                               std::max(workgroup->threads_num[1], 1u) *
+			                               std::max(workgroup->threads_num[2], 1u);
+			if (total_threads % 64u != 0u && (total_threads % 64u) <= 32u) {
+				high_launched = ConstantBool(state, false);
+			}
+		}
+		const auto high_hit = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpLogicalAnd, TypeBool(state), high_hit, high_launched,
+		    Binary(state, spv::OpIEqual, TypeBool(state), low, ConstantU32(state, 0xffffffffu)));
+		const auto use_high = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), use_high, in_high, high_hit);
+		const auto high_below = EmitBinaryU32(state, spv::OpBitwiseAnd, low, below);
+		const auto low_word   = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpSelect, TypeU32(state), low_word, in_high, low,
 		                          EmitBinaryU32(state, spv::OpBitwiseAnd, low, below));
 		word = state.builder.AllocateId();

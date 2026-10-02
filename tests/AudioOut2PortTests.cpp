@@ -309,7 +309,7 @@ void TestSynchronousDevicePushBypassesModelledQueue() {
 	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
 	      "device port create failed");
 
-	uint32_t pcm[512] {};
+	float pcm[512 * 2] {};
 	SetPcm(port, pcm);
 	ResetOutputCalls();
 
@@ -356,7 +356,7 @@ void TestAsynchronousDevicePushKeepsQueueBounded() {
 	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
 	      "device port create failed");
 
-	uint32_t pcm[512] {};
+	float pcm[512 * 2] {};
 	SetPcm(port, pcm);
 	ResetOutputCalls();
 

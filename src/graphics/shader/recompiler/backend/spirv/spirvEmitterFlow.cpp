@@ -730,9 +730,6 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (ctx.other_half != nullptr && ctx.half != 0 && !WaveHalvesInHostSubgroup(ctx.state)) {
-		return ctx.other_half->Def(inst);
-	}
 	// V_READLANE's lane is an SGPR or a constant, so the result is uniform too; see
 	// EmitReadFirstLane.
 	auto& state = ctx.state;

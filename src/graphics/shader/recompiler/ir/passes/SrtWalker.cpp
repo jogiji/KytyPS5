@@ -803,18 +803,26 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
-		case ValueOpcode::LogicalAnd:
-			if (binary()) {
-				result = (a != 0u) && (b != 0u);
+		case ValueOpcode::LogicalAnd: {
+			const bool left = Arg(inst, 0, a);
+			if (left && a == 0u) {
+				result = 0u;
 				return true;
 			}
-			return false;
-		case ValueOpcode::LogicalOr:
-			if (binary()) {
-				result = (a != 0u) || (b != 0u);
+			if (!Arg(inst, 1, b) || (b != 0u && !left)) return false;
+			result = b != 0u;
+			return true;
+		}
+		case ValueOpcode::LogicalOr: {
+			const bool left = Arg(inst, 0, a);
+			if (left && a != 0u) {
+				result = 1u;
 				return true;
 			}
-			return false;
+			if (!Arg(inst, 1, b) || (b == 0u && !left)) return false;
+			result = b != 0u;
+			return true;
+		}
 		case ValueOpcode::LogicalXor:
 			if (binary()) {
 				result = (a != 0u) != (b != 0u);
@@ -857,15 +865,34 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 	if (m_program.control_flow.empty()) {
 		return {};
 	}
-	// Conditions over flat SRT slots use this walker; see CompiledResourcePlan.
-	const auto& direct = CompileResourcePlan(m_program).direct_conditions;
-	auto&       strict = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-	auto&       active = m_program.ThreadScratch().active_sources;
+	return m_program.ThreadScratch().active_sources;
+}
+
+bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	if (!m_program.srt_plan_complete) return false;
+	const auto refresh = [&](uint32_t slot) {
+		if (slot >= m_program.srt_reads.size()) return false;
+		const auto& read = m_program.srt_reads[slot];
+		const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
+		                   m_clean_flat_slots[read.flat_offset] != 0u;
+		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
+			return false;
+		auto& evaluator = clean ? *m_clean_evaluator : *this;
+		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
+	};
+	auto& active = m_program.ThreadScratch().active_sources;
+	if (m_program.control_flow.empty()) {
+		active.clear();
+		flat.resize(m_program.srt_reads.size());
+		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
+			if (!refresh(slot)) return false;
+		}
+		return true;
+	}
+	flat.assign(m_program.srt_reads.size(), 0u);
 	active.assign(m_program.descriptor_sources.size(), 1u);
 	for (const auto& block: m_program.control_flow) {
-		for (const auto source: block.sources) {
-			active.at(source) = 0u;
-		}
+		for (const auto source: block.sources) active.at(source) = 0u;
 	}
 	auto& visited = m_program.ThreadScratch().visited_blocks;
 	auto& pending = m_program.ThreadScratch().pending_blocks;
@@ -875,40 +902,20 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 	while (!pending.empty()) {
 		const auto index = pending.back();
 		pending.pop_back();
-		if (visited.at(index)) {
-			continue;
-		}
+		if (visited.at(index)) continue;
 		visited[index] = 1u;
 		const auto& block = m_program.control_flow[index];
-		for (const auto source: block.sources) {
-			active[source] = 1u;
+		for (const auto source: block.sources) active[source] = 1u;
+		for (const auto slot: block.srt_reads) {
+			if (!refresh(slot)) return false;
 		}
 		uint32_t condition = 0;
-		auto&    evaluator = index < direct.size() && direct[index] != 0u ? *this : strict;
+		auto&    predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
 		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
-		    evaluator.Evaluate(block.condition, condition)) {
+		    predicate.Evaluate(block.condition, condition)) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
-		}
-	}
-	return active;
-}
-
-bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
-	if (!m_program.srt_plan_complete) {
-		return false;
-	}
-	flat.resize(m_program.srt_reads.size());
-	for (const auto& read: m_program.srt_reads) {
-		const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
-		                   m_clean_flat_slots[read.flat_offset] != 0u;
-		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
-			return false;
-		}
-		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		if (read.flat_offset >= flat.size() || !evaluator.Evaluate(read.value, flat[read.flat_offset])) {
-			return false;
 		}
 	}
 	return true;
@@ -1912,157 +1919,15 @@ std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
 	if (m_program.control_flow.empty()) {
 		return {};
 	}
-	auto&      active    = m_program.ThreadScratch().active_sources;
-	auto&      strict    = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-	const bool evaluates = m_runtime.read_specialization_memory != nullptr;
-	const auto outcome   = [&](uint32_t index) -> uint8_t {
-		uint32_t condition = 0;
-		auto&    evaluator = m_compiled.direct_conditions[index] != 0u ? *this : strict;
-		if (!evaluator.Evaluate(m_compiled.conditions[index], condition)) {
-			return 2u;
-		}
-		return condition != 0u ? 1u : 0u;
-	};
-	// The walk below depends on the plan only through the outcomes of the conditions it
-	// evaluates, in an order those outcomes fix. Follow the tree of earlier walks (see
-	// ResourcePlan::ActiveTreeNode) with this refresh's outcomes; reaching a leaf means the walk
-	// would visit the same blocks and find the same sources.
-	using TreeNode = ResourcePlan::ActiveTreeNode;
-	auto& tree     = m_program.ThreadScratch().active_tree;
-	auto& trace    = m_program.ThreadScratch().active_trace;
-	if (evaluates && !tree.empty()) {
-		uint32_t node = 0;
-		while (node != TreeNode::None && tree[node].block != TreeNode::None) {
-			node = tree[node].next[outcome(tree[node].block)];
-		}
-		if (node != TreeNode::None && tree[node].sources != TreeNode::None) {
-			const auto first = m_program.ThreadScratch().active_tree_sources.begin() + tree[node].sources;
-			const auto count = static_cast<ptrdiff_t>(m_program.descriptor_sources.size());
-			active.assign(first, first + count);
-			return active;
-		}
-	}
-	trace.clear();
-	if (!m_compiled.initial_active.empty()) {
-		active.assign(m_compiled.initial_active.begin(), m_compiled.initial_active.end());
-	} else {
-		active.assign(m_program.descriptor_sources.size(), 1u);
-		for (const auto& block: m_program.control_flow) {
-			for (const auto source: block.sources) {
-				active.at(source) = 0u;
-			}
-		}
-	}
-	auto&      visited     = m_program.ThreadScratch().visited_blocks;
-	auto&      pending     = m_program.ThreadScratch().pending_blocks;
-	const auto block_count = m_program.control_flow.size();
-	// Most plans have at most 64 blocks; track those in a mask instead of clearing a vector.
-	const bool small       = block_count <= 64u;
-	uint64_t   visited_mask = 0;
-	if (!small) {
-		visited.assign(block_count, 0u);
-	}
-	pending.clear();
-	pending.push_back(0u);
-	while (!pending.empty()) {
-		const auto index = pending.back();
-		pending.pop_back();
-		EXIT_IF(index >= block_count);
-		if (small) {
-			const auto bit = uint64_t {1} << index;
-			if ((visited_mask & bit) != 0u) {
-				continue;
-			}
-			visited_mask |= bit;
-		} else {
-			if (visited[index]) {
-				continue;
-			}
-			visited[index] = 1u;
-		}
-		const auto& block = m_program.control_flow[index];
-		for (const auto source: block.sources) {
-			active[source] = 1u;
-		}
-		// Nothing reachable from here adds a source: skip the condition and its strict reads.
-		if (!m_compiled.inert_successors.empty() && m_compiled.inert_successors[index] != 0u) {
-			continue;
-		}
-		const auto condition_node = m_compiled.conditions[index];
-		const auto result =
-		    condition_node != ResourceNode::NoNode && evaluates ? outcome(index) : uint8_t {2};
-		if (condition_node != ResourceNode::NoNode && evaluates) {
-			trace.push_back({index, result});
-		}
-		if (result != 2u) {
-			pending.push_back(block.successors[result != 0u ? 0u : 1u]);
-		} else {
-			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
-		}
-	}
-	// Add this walk to the tree, up to a bound on its size.
-	constexpr size_t MaxTreeNodes = 4096;
-	auto&            sources      = m_program.ThreadScratch().active_tree_sources;
-	if (evaluates && active.size() == m_program.descriptor_sources.size() &&
-	    tree.size() + trace.size() + 1u <= MaxTreeNodes) {
-		if (tree.empty()) {
-			tree.emplace_back();
-		}
-		uint32_t node = 0;
-		bool     fits = true;
-		for (const auto& step: trace) {
-			// Earlier walks with the same outcomes so far evaluated the same condition here.
-			if (tree[node].block == TreeNode::None && tree[node].sources == TreeNode::None) {
-				tree[node].block = step.block;
-			} else if (tree[node].block != step.block) {
-				fits = false;
-				break;
-			}
-			auto next = tree[node].next[step.outcome];
-			if (next == TreeNode::None) {
-				next                          = static_cast<uint32_t>(tree.size());
-				tree[node].next[step.outcome] = next;
-				tree.emplace_back();
-			}
-			node = next;
-		}
-		fits = fits && tree[node].block == TreeNode::None;
-		if (fits && tree[node].sources == TreeNode::None) {
-			tree[node].sources = static_cast<uint32_t>(sources.size());
-			sources.insert(sources.end(), active.begin(), active.end());
-		} else if (!fits) {
-			// Not expected: the walk order is a function of the outcomes. Start over.
-			tree.clear();
-			sources.clear();
-		}
-	}
-	return active;
+	return m_program.ThreadScratch().active_sources;
 }
 
 bool SrtEvaluator::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) {
 		return false;
 	}
-	flat.resize(m_program.srt_reads.size());
-	// Run slots are ordinary: this walker evaluates them. A run that cannot be read whole
-	// evaluates its slots one by one, and fails exactly as that would.
-	const bool runs = !m_compiled.flat_runs.empty() && m_active_mask == ResourceNode::NoNode;
-	for (uint32_t run = 0; runs && run < m_compiled.flat_runs.size(); run++) {
-		const auto& info = m_compiled.flat_runs[run];
-		if (ReadFlatRun(info, flat)) {
-			continue;
-		}
-		for (uint32_t index = 0; index < info.count; index++) {
-			const auto slot = m_compiled.run_entries[info.first + index].slot;
-			if (!Evaluate(m_compiled.slots[slot], flat[m_program.srt_reads[slot].flat_offset])) {
-				return false;
-			}
-		}
-	}
-	for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
-		if (runs && m_compiled.in_run[slot] != 0u) {
-			continue;
-		}
+	const auto refresh = [&](uint32_t slot) -> bool {
+		if (slot >= m_program.srt_reads.size()) return false;
 		const auto offset = m_program.srt_reads[slot].flat_offset;
 		const bool clean  = m_clean_flat_slots && offset < m_compiled.clean_slots.size() &&
 		                   m_compiled.clean_slots[offset] != 0u;
@@ -2071,11 +1936,76 @@ bool SrtEvaluator::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			return false;
 		}
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		if (offset >= flat.size() || !evaluator.Evaluate(m_compiled.slots[slot], flat[offset])) {
-			return false;
+		return offset < flat.size() && evaluator.Evaluate(m_compiled.slots[slot], flat[offset]);
+	};
+
+	auto& active = m_program.ThreadScratch().active_sources;
+	if (m_program.control_flow.empty()) {
+		active.clear();
+		flat.resize(m_program.srt_reads.size());
+		// Run slots are ordinary: this walker evaluates them. A run that cannot be read whole
+		// evaluates its slots one by one, and fails exactly as that would.
+		const bool runs = !m_compiled.flat_runs.empty() && m_active_mask == ResourceNode::NoNode;
+		for (uint32_t run = 0; runs && run < m_compiled.flat_runs.size(); run++) {
+			const auto& info = m_compiled.flat_runs[run];
+			if (ReadFlatRun(info, flat)) {
+				continue;
+			}
+			for (uint32_t index = 0; index < info.count; index++) {
+				const auto slot = m_compiled.run_entries[info.first + index].slot;
+				if (!Evaluate(m_compiled.slots[slot], flat[m_program.srt_reads[slot].flat_offset])) {
+					return false;
+				}
+			}
 		}
+		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
+			if (runs && m_compiled.in_run[slot] != 0u) {
+				continue;
+			}
+			if (!refresh(slot)) {
+				return false;
+			}
+		}
+		if (m_active_mask == ResourceNode::NoNode) {
+			m_flat = &flat;
+		}
+		return true;
 	}
-	// Only this walker's own contexts use the shortcut; nested EXEC walkers evaluate normally.
+
+	flat.assign(m_program.srt_reads.size(), 0u);
+	active.assign(m_program.descriptor_sources.size(), 1u);
+	for (const auto& block: m_program.control_flow) {
+		for (const auto source: block.sources) active.at(source) = 0u;
+	}
+	auto& visited = m_program.ThreadScratch().visited_blocks;
+	auto& pending = m_program.ThreadScratch().pending_blocks;
+	visited.assign(m_program.control_flow.size(), 0u);
+	pending.clear();
+	pending.push_back(0u);
+	auto& strict = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+	while (!pending.empty()) {
+		const auto index = pending.back();
+		pending.pop_back();
+		if (visited.at(index)) continue;
+		visited[index] = 1u;
+		const auto& block = m_program.control_flow[index];
+		for (const auto source: block.sources) active[source] = 1u;
+		for (const auto slot: block.srt_reads) {
+			if (!refresh(slot)) return false;
+		}
+		uint32_t condition = 0;
+		const auto condition_node = index < m_compiled.conditions.size() ? m_compiled.conditions[index] : ResourceNode::NoNode;
+		const bool is_direct = index < m_compiled.direct_conditions.size() && m_compiled.direct_conditions[index] != 0u;
+		if (condition_node != ResourceNode::NoNode &&
+		    (is_direct || m_runtime.read_specialization_memory != nullptr)) {
+			auto& evaluator = is_direct ? *this : strict;
+			if (evaluator.Evaluate(condition_node, condition)) {
+				pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+				continue;
+			}
+		}
+		pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+	}
 	if (m_active_mask == ResourceNode::NoNode) {
 		m_flat = &flat;
 	}

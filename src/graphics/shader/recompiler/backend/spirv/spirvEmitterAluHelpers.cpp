@@ -216,17 +216,21 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 }
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero) {
-	// A finite value of magnitude 2^23 or more is a whole number, so its fraction is +0 without
-	// a test for it (VectorSinCosLargeFiniteSpecialCases).
-	const auto reduced = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), reduced, GlslStd450(state),
+	const auto fract        = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), fract, GlslStd450(state),
 	                          GLSLstd450Fract, src);
+	const auto bits         = Unary(state, spv::OpBitcast, TypeU32(state), src);
+	const auto abs_bits     = EmitAndConstant(state, bits, 0x7fffffffu);
+	const auto large        = EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, abs_bits, 0x4b000000u);
+	const auto finite       = EmitCompareU32Constant(state, spv::OpULessThan, abs_bits, 0x7f800000u);
+	const auto large_finite = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), large_finite, large, finite);
+	const auto reduced      = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeF32(state), reduced, large_finite, ConstantF32(state, 0), fract);
 	if (!preserve_signed_zero) {
 		return reduced;
 	}
-	const auto bits = Unary(state, spv::OpBitcast, TypeU32(state), src);
-	const auto zero = EmitCompareU32Constant(state, spv::OpIEqual,
-	                                         EmitAndConstant(state, bits, 0x7fffffffu), 0);
+	const auto zero = EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0);
 	const auto ret  = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelect, TypeF32(state), ret, zero, src, reduced);
 	return ret;

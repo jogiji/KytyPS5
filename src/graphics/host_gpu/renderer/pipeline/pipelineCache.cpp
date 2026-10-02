@@ -355,7 +355,6 @@ struct PipelineCache::ProgramCache {
 		// the last hit stays valid while the specialization and push data cursor are unchanged.
 		uint32_t                                    last_permutation = UINT32_MAX;
 		uint32_t                                    last_push_cursor = 0;
-		bool                                        skip_dispatch = false;
 		std::vector<PendingPermutation>             pending;
 		// Set once a GPU-thread refresh succeeded (its plan is compiled): only then may the draw
 		// speculation thread refresh this plan (see Speculate).
@@ -585,11 +584,11 @@ struct PipelineCache::ProgramCache {
 		} else {
 			Decoder::DecodeProgram(params.code, front);
 		}
-		bool result = front.has_bvh || stores(front);
+		bool result = stores(front);
 		if (!result && !params.back_code.empty()) {
 			Decoder::Program back;
 			Decoder::DecodeProgram(params.back_code, back);
-			result = back.has_bvh || stores(back);
+			result = stores(back);
 		}
 		stores_data.emplace(params.hash, result);
 		return result;
@@ -714,9 +713,6 @@ struct PipelineCache::ProgramCache {
 					     static_cast<unsigned long long>(params.hash));
 				}
 			}
-			if (source.skip_dispatch) {
-				return {};
-			}
 			if (auto program = existing(source)) {
 				return *program;
 			}
@@ -728,9 +724,6 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto entry = programs.find(lookup_key);
-		if (entry != programs.end() && entry->second.skip_dispatch) {
-			return {};
-		}
 		if (entry != programs.end() && &entry->second != refreshed) {
 			if (auto program = existing(entry->second)) {
 				return *program;
@@ -777,12 +770,6 @@ struct PipelineCache::ProgramCache {
 			}
 			if (!translated) {
 				translated = ShaderRecompiler::TranslateProgram(params.code, options);
-			}
-			if (translated->skip_dispatch) {
-				std::unique_lock lock(programs_mutex);
-				entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
-				entry->second.skip_dispatch = true;
-				return {};
 			}
 			{
 				std::unique_lock lock(programs_mutex);
@@ -1376,7 +1363,7 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 			auto         translated = ShaderRecompiler::TranslateProgram(params.code, options);
 			// Reject inconsistent metadata before ApplyResourceSpecialization's hard assertions.
 			// Live guest lookups still compile normally if a record cannot be replayed.
-			if (translated.skip_dispatch || !translated.program.resource_tracking_complete ||
+			if (!translated.program.resource_tracking_complete ||
 			    translated.program.info.buffers.size() != record.specialization.buffers.size() ||
 			    translated.program.info.images.size() > record.specialization.images.size()) {
 				continue;
@@ -1839,13 +1826,6 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		}
 		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
 		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
-		static_params.color_srcblend[slot]       = bc.color_srcblend;
-		static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
-		static_params.color_destblend[slot]      = bc.color_destblend;
-		static_params.alpha_srcblend[slot]       = bc.alpha_srcblend;
-		static_params.alpha_comb_fcn[slot]       = bc.alpha_comb_fcn;
-		static_params.alpha_destblend[slot]      = bc.alpha_destblend;
-		static_params.separate_alpha_blend[slot] = bc.separate_alpha_blend;
 		const bool alpha_remap =
 		    slot == 0 && ps_input_info != nullptr && ps_input_info->alpha_blend_source_remap;
 		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
@@ -1863,6 +1843,17 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		}
 		if (alpha_remap) {
 			static_params.blend_alpha_source_remap = true;
+		}
+		if (static_params.blend_enable[slot]) {
+			static_params.color_srcblend[slot]       = bc.color_srcblend;
+			static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
+			static_params.color_destblend[slot]      = bc.color_destblend;
+			static_params.separate_alpha_blend[slot] = bc.separate_alpha_blend;
+			if (bc.separate_alpha_blend) {
+				static_params.alpha_srcblend[slot]  = bc.alpha_srcblend;
+				static_params.alpha_comb_fcn[slot]  = bc.alpha_comb_fcn;
+				static_params.alpha_destblend[slot] = bc.alpha_destblend;
+			}
 		}
 	}
 	const bool with_depth =

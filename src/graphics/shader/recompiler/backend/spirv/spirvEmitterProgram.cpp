@@ -419,6 +419,12 @@ bool EmitIndexedSelect(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
+	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
+		// Both operations already combine both emulated halves into one whole-wave result.
+		ctx.Define(inst, ctx.other_half->Result(inst));
+		return;
+	}
 	if (inst.GetOpcode() == IR::ValueOpcode::SelectU32 && EmitIndexedSelect(ctx, inst)) {
 		return;
 	}
@@ -653,13 +659,11 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 }
 
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
-	if (other_half != nullptr) {
-		const auto* inst = predicate.Resolve().TryInstruction();
-		if (inst != nullptr) {
-			if (const auto it = state.block_ballots.find(inst);
-			    it != state.block_ballots.end() && it->second.block == state.current_block) {
-				return it->second.id;
-			}
+	const auto* inst = predicate.Resolve().TryInstruction();
+	if (inst != nullptr) {
+		if (const auto it = state.block_ballots.find(inst);
+		    it != state.block_ballots.end() && it->second.block == state.current_block) {
+			return it->second.id;
 		}
 	}
 	const auto ballot_type = TypeU32Vector(state, 4);
@@ -682,6 +686,9 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	    spv::OpGroupNonUniformBallot, ballot_type, low, scope,
 	    live(other_half == nullptr || half == 0 ? Def(predicate) : other_half->Def(predicate)));
 	if (other_half == nullptr) {
+		if (inst != nullptr) {
+			state.block_ballots[inst] = {state.current_block, low};
+		}
 		return low;
 	}
 	const auto high      = state.builder.AllocateId();
@@ -893,6 +900,7 @@ void EmitProgram(EmitterState& state) {
 		}
 	}
 	DefineGetBdaPointer(state);
+	DefineBvhIntersect(state);
 	for (const auto* block: program.blocks) {
 		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {
 			    return inst.GetOpcode() == IR::ValueOpcode::SwizzleU32 ||

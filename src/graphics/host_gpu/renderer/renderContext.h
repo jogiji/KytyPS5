@@ -116,6 +116,7 @@ private:
 	std::array<uint64_t, 256> m_mip_stats_last_marked {};
 	int64_t                   m_mip_stats_relief_end = 0;
 	int64_t                   m_mip_stats_rearm_time = 0;
+	bool                      m_bda_logged = false;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

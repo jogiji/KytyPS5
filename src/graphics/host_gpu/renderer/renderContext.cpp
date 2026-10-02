@@ -207,6 +207,10 @@ void RenderContext::AdvanceBdaEpochForGpuWrite() noexcept {
 // (waits, conditions, predication), new page-table entries (buffer registration), GPU mappings,
 // kernel invalidations and the GPU thread's own writes.
 void RenderContext::PrepareBda() {
+	if (!m_bda_logged) {
+		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
+		m_bda_logged = true;
+	}
 	RecordUpload(UploadSource::BdaPass, 0, 0);
 	m_fault_process_pending = true;
 	const auto epoch        = m_bda_epoch.load(std::memory_order_acquire);
