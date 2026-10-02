@@ -1837,6 +1837,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
+	program->mapped_size = program->base_size_aligned + tls_handler_size;
 	const bool host_supports_vrsqrtps = cpuinfo_initialize() && cpuinfo_has_x86_avx();
 	const bool rewrite_vrsqrtps       = Config::RewriteVrsqrtpsEnabled() && host_supports_vrsqrtps;
 	const bool emulate_rsqrt =
