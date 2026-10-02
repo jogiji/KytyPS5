@@ -640,6 +640,10 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 	return Result(*inst);
 }
 
+uint32_t ValueEmitContext::Def(const IR::Inst& inst) {
+	return Def(IR::Value(&inst));
+}
+
 uint32_t ValueEmitContext::Arg(const IR::Inst& inst, size_t index) {
 	return Def(inst.Arg(index));
 }
@@ -649,6 +653,15 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 }
 
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
+	if (other_half != nullptr) {
+		const auto* inst = predicate.Resolve().TryInstruction();
+		if (inst != nullptr) {
+			if (const auto it = state.block_ballots.find(inst);
+			    it != state.block_ballots.end() && it->second.block == state.current_block) {
+				return it->second.id;
+			}
+		}
+	}
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
 	const auto live        = [&](uint32_t value) {
@@ -681,6 +694,9 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high_word, high, 0);
 	state.builder.AddFunction(spv::OpCompositeConstruct, ballot_type, ballot, low_word, high_word,
 	                          ConstantU32(state, 0), ConstantU32(state, 0));
+	if (const auto* inst = predicate.Resolve().TryInstruction(); inst != nullptr) {
+		state.block_ballots[inst] = {state.current_block, ballot};
+	}
 	return ballot;
 }
 

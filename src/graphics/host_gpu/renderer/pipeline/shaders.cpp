@@ -1138,6 +1138,102 @@ static void DumpPipelineStatistics(GraphicContext& graphics, const GraphicsPipel
 	graphics.device.destroyPipeline(pipeline, nullptr);
 }
 
+static void DumpComputePipelineStatistics(GraphicContext& graphics, vk::PipelineLayout layout,
+                                         vk::ShaderModule compute_module, uint32_t wave_size,
+                                         bool required_subgroup, uint64_t compute_hash) {
+	vk::ComputePipelineCreateInfo info {};
+	info.flags = vk::PipelineCreateFlagBits::eCaptureStatisticsKHR |
+	             vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size {};
+	info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	info.stage.module = compute_module;
+	info.stage.pName  = "main";
+	if (required_subgroup) {
+		subgroup_size.requiredSubgroupSize = wave_size;
+		info.stage.pNext                   = &subgroup_size;
+	}
+	info.layout            = layout;
+	info.basePipelineIndex = -1;
+	vk::Pipeline pipeline  = nullptr;
+	const auto   start     = std::chrono::steady_clock::now();
+	if (graphics.device.createComputePipelines(nullptr, 1, &info, nullptr, &pipeline) !=
+	        vk::Result::eSuccess ||
+	    pipeline == nullptr) {
+		std::printf("pipeline-stats: capture failed cs=%016llx\n",
+		            static_cast<unsigned long long>(compute_hash));
+		return;
+	}
+	static std::atomic_uint32_t dumps = 0;
+	const auto                  path  = fmt::format("pipeline-stats-cs-{:016x}-{}.txt", compute_hash, dumps++);
+	FILE*                       file  = std::fopen(path.c_str(), "w");
+	const vk::PipelineInfoKHR   pipeline_info {.pipeline = pipeline};
+	uint32_t                    executables = 0;
+	(void)graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &executables, nullptr);
+	std::vector<vk::PipelineExecutablePropertiesKHR> properties(executables);
+	(void)graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &executables,
+	                                                         properties.data());
+	std::string summary = fmt::format(
+	    " compile_ms={:.1f}",
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+	for (uint32_t index = 0; index < executables && file != nullptr; index++) {
+		const vk::PipelineExecutableInfoKHR executable {.pipeline = pipeline, .executableIndex = index};
+		std::fprintf(file, "== %s: %s\n", properties[index].name.data(),
+		             properties[index].description.data());
+		uint32_t count = 0;
+		(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &count, nullptr);
+		std::vector<vk::PipelineExecutableStatisticKHR> statistics(count);
+		(void)graphics.device.getPipelineExecutableStatisticsKHR(&executable, &count,
+		                                                         statistics.data());
+		summary += fmt::format(" [{}]", properties[index].name.data());
+		for (const auto& statistic: statistics) {
+			std::string value;
+			switch (statistic.format) {
+				case vk::PipelineExecutableStatisticFormatKHR::eBool32:
+					value = statistic.value.b32 ? "true" : "false";
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eInt64:
+					value = fmt::format("{}", statistic.value.i64);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eUint64:
+					value = fmt::format("{}", statistic.value.u64);
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eFloat64:
+					value = fmt::format("{:.3f}", statistic.value.f64);
+					break;
+			}
+			std::fprintf(file, "stat %s = %s\n", statistic.name.data(), value.c_str());
+			summary += fmt::format(" {}={}", statistic.name.data(), value);
+		}
+		count = 0;
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &count,
+		                                                                      nullptr);
+		std::vector<vk::PipelineExecutableInternalRepresentationKHR> representations(count);
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(
+		    &executable, &count, representations.data());
+		std::vector<std::vector<char>> texts(count);
+		for (uint32_t r = 0; r < count; r++) {
+			texts[r].resize(representations[r].dataSize + 1u, '\0');
+			representations[r].pData = texts[r].data();
+		}
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(
+		    &executable, &count, representations.data());
+		for (uint32_t r = 0; r < count; r++) {
+			std::fprintf(file, "-- %s: %s\n", representations[r].name.data(),
+			             representations[r].description.data());
+			if (representations[r].isText) {
+				std::fputs(texts[r].data(), file);
+				std::fputc('\n', file);
+			}
+		}
+	}
+	if (file != nullptr) {
+		std::fclose(file);
+	}
+	std::printf("pipeline-stats: cs=%016llx -> %s:%s\n",
+	            static_cast<unsigned long long>(compute_hash), path.c_str(), summary.c_str());
+	graphics.device.destroyPipeline(pipeline, nullptr);
+}
+
 int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                            const PipelineRenderingState&          rendering,
                            const PipelineVertexInputState&        vertex_input,
@@ -1242,6 +1338,19 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_IF(pipeline.pipeline != nullptr);
 	pipeline.pipeline = create();
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	if (const auto& hashes = PipelineStatsHashes();
+	    !hashes.empty() && graphics.pipeline_executable_info_enabled) [[unlikely]] {
+		const auto compute_hash =
+		    input_info.stage.program != nullptr ? input_info.stage.program->shader_hash : 0;
+		if (std::ranges::find(hashes, compute_hash) != hashes.end()) {
+			const auto wave_size         = input_info.stage.program->wave_size;
+			const bool required_subgroup = graphics.compute_subgroup_size_control_enabled &&
+			                               wave_size >= graphics.min_subgroup_size &&
+			                               wave_size <= graphics.max_subgroup_size;
+			DumpComputePipelineStatistics(graphics, pipeline.pipeline_layout, compute_module,
+			                              wave_size, required_subgroup, compute_hash);
+		}
+	}
 }
 
 } // namespace Libs::Graphics

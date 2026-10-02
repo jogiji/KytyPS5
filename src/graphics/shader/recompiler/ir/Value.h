@@ -20,6 +20,7 @@ class Value {
 public:
 	Value() = default;
 	explicit Value(Inst* value);
+	explicit Value(const Inst* value);
 	explicit Value(ScalarReg value);
 	explicit Value(VectorReg value);
 	explicit Value(bool value);

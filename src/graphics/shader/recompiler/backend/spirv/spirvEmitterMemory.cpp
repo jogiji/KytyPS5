@@ -1177,7 +1177,7 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const bool append = inst.GetOpcode() == IR::ValueOpcode::DataAppend;
 	auto&      state  = ctx.state;
 	if (ctx.half == 1) {
-		return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
+		return ctx.other_half->Def(inst);
 	}
 	const auto mem           = ctx.Memory(inst);
 	const auto offset        = mem.offset & 0xfffcu;

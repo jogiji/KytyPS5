@@ -7,6 +7,7 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 Value::Value(Inst* value): type(Type::Opaque), inst(value) {}
+Value::Value(const Inst* value): type(Type::Opaque), inst(const_cast<Inst*>(value)) {}
 Value::Value(ScalarReg value): type(Type::ScalarReg), scalar_reg(value) {}
 Value::Value(VectorReg value): type(Type::VectorReg), vector_reg(value) {}
 Value::Value(bool value): type(Type::U1), imm_u1(value) {}

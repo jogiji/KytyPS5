@@ -137,6 +137,12 @@ struct EmitterState {
 	bool                                             indexed_selects_found = false;
 	std::unordered_set<const IR::Inst*>              indexed_select_heads;
 	std::unordered_set<const IR::Inst*>              indexed_select_members;
+
+	struct CachedBallot {
+		const IR::Block* block = nullptr;
+		uint32_t         id    = 0;
+	};
+	std::unordered_map<const IR::Inst*, CachedBallot> block_ballots;
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -216,6 +222,7 @@ struct ValueEmitContext {
 	explicit ValueEmitContext(EmitterState& state_): state(state_) {}
 
 	uint32_t              Def(IR::Value value);
+	uint32_t              Def(const IR::Inst& inst);
 	uint32_t              Arg(const IR::Inst& inst, size_t index);
 	uint32_t              HalfArg(const IR::Inst& inst, size_t index, uint32_t half);
 	uint32_t              Ballot(IR::Value predicate);

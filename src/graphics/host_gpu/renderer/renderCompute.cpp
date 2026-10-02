@@ -288,8 +288,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool large_workgroup =
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const bool                   has_sampler = !program.info.samplers.empty();
+	const bool                   target_cs   = (program.shader_hash == 0xb57099b84b0b69e3ULL);
 	static std::atomic<uint32_t> dispatch_log_count {0};
-	if ((large_workgroup || has_sampler) &&
+	if ((large_workgroup || has_sampler || target_cs) &&
 	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
 		const auto sampled_images = std::count_if(
 		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
@@ -414,6 +415,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	GpuZones::Mark(vk_buffer, DrainStats::Zone::GameDispatch, input_info.stage.program->shader_hash);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	if (target_cs) {
+		static std::atomic<uint32_t> b570_exec_count {0};
+		if (b570_exec_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("TargetCS[b57099b84b0b69e3]: vkCmdDispatch(%u, %u, %u)\n",
+			     thread_group_x, thread_group_y, thread_group_z);
+		}
+	}
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
@@ -498,6 +506,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	GpuZones::Mark(vk_buffer, DrainStats::Zone::GameDispatch, input_info.stage.program->shader_hash);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	if (input_info.stage.program->shader_hash == 0xb57099b84b0b69e3ULL) {
+		static std::atomic<uint32_t> b570_ind_count {0};
+		if (b570_ind_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("TargetCS[b57099b84b0b69e3]: vkCmdDispatchIndirect args_addr=0x%016llx offset=%u\n",
+			     (unsigned long long)args_addr, args_offset);
+		}
+	}
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	m_context.GetBufferCache().OnCommandRecorded();

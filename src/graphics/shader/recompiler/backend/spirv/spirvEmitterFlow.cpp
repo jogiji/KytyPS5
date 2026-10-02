@@ -679,7 +679,7 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// Argument 1 is the branch's emitted condition; argument 0 is only for analysis.
 	if (ctx.other_half == nullptr) return ctx.Arg(inst, 1);
 	// A native scalar branch makes one decision for both emulated wave halves.
-	if (ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
+	if (ctx.half != 0) return ctx.other_half->Def(inst);
 	const auto kind = inst.Flags<CFG::BranchCondition>();
 	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 1);
 	const auto ballot = ctx.Ballot(inst.Arg(1));
@@ -699,11 +699,17 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return result;
 }
 
-uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
+uint32_t EmitBallot(ValueEmitContext& ctx, const IR::Inst& inst, IR::Value predicate) {
+	if (ctx.other_half != nullptr && ctx.half != 0) {
+		return ctx.other_half->Def(inst);
+	}
 	return ctx.Ballot(predicate);
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.other_half != nullptr && ctx.half != 0) {
+		return ctx.other_half->Def(inst);
+	}
 	const auto ballot   = ctx.Ballot(inst.Arg(1));
 	const auto lane     = ctx.FirstLane(ballot);
 	const auto shuffled = ctx.Shuffle(inst, 0, lane);
@@ -724,6 +730,9 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.other_half != nullptr && ctx.half != 0 && !WaveHalvesInHostSubgroup(ctx.state)) {
+		return ctx.other_half->Def(inst);
+	}
 	// V_READLANE's lane is an SGPR or a constant, so the result is uniform too; see
 	// EmitReadFirstLane.
 	auto& state = ctx.state;

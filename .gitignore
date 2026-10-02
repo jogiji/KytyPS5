@@ -11,3 +11,6 @@ _perf_*.log
 run_astro_profile.ps1
 kyty_settings.ini
 thread-dump-*.txt
+_dump_*/
+*.bin
+pipeline-stats-*.txt
