@@ -254,3 +254,79 @@ REPRODUCED (large-gap behavior; new range 45.92–58.70 ms/frame)
 SAFE TO BEGIN dGPU-ONLY A/B:
 YES
 ```
+
+## Dedicated NVIDIA vs Optimus A/B
+
+### dGPU-only graphics environment
+
+After the reboot into dedicated NVIDIA mode, `vulkaninfo --summary` enumerated one Vulkan device: GPU 0, NVIDIA GeForce RTX 4090 Laptop GPU, vendor `0x10de`, device `0x2757`, driver `617.14`. The Intel UHD adapter remained as a Windows PnP phantom/unknown display entry and did not appear in the Vulkan device list or active `Win32_VideoController` list. `nvidia-smi topo -m` showed only GPU 0; NVIDIA reported display active, and Windows reported 2560x1600. During the run, `nvidia-smi` listed `kyty_emulator.exe` PID 53164 as a C+G process on GPU 0. The window title identified build 6881861 Release, Astro Bot PPSA21567 01.018.000, and the RTX 4090. This confirms `--gpu 0` selected the RTX 4090 for the observed run; no Intel Vulkan device was exposed.
+
+The executable SHA256 was `BF8C4CA9C058E8AD40E66CDB5F975AB6A17E230227718B85A06CEA26CFF456D`, matching the pre-run binary. The run used `launch_test_combined_fastpath.bat` and its normal-profile flags, with `KYTY_GPU_ZONES=1`; no draw-phase, PM4, or queue diagnostics were enabled. Startup loaded 42,927,848 cache bytes and replayed all 679 recorded permutations, skipping none. The on-disk cache was 42,927,995 bytes with SHA256 `8831a88abf8dca3588ed862fc5cbdacb34b485c6b5ace7b148a4833e46d25beb` before and after the run, including after normal emulator exit. The cache remained warm and unchanged.
+
+### Scene and capture method
+
+Rajiv confirmed the dGPU scene held after the instruction used for the Optimus reference: Sky Garden opening path, Astro centered on the pink stone path, camera behind Astro facing the glass tower. The same nearby pink-leaf tree and blue bot bubble were to the right of the path in the Optimus screenshot reference. No numerical character/camera coordinates or new dGPU screenshot were recorded, so the scene match is practical and visual rather than coordinate-exact. The emulator was visible and operated interactively. The 60 prior five-second intervals were treated as warm-up/navigation; the next three complete intervals were accepted. The complete ignored telemetry copy is `_perf_gpu_dgpu_only_20261003.log`.
+
+### Individual dGPU-only windows
+
+| Window | Presents / FPS | Implied frame ms | GPU busy ms/frame | GPU gap ms/frame | #UD/frame |
+|---|---:|---:|---:|---:|---:|
+| 1 | 67 / 13.4 | 74.63 | 27.46 | 47.35 | 0 |
+| 2 | 67 / 13.4 | 74.63 | 26.62 | 47.73 | 0 |
+| 3 | 68 / 13.6 | 73.53 | 26.89 | 46.68 | 0 |
+
+Combined over 202 presents in 15 seconds, the representative dGPU-only values are 13.47 FPS, 74.26 ms/frame, 26.99 ms GPU busy, and 47.25 ms GPU gap. The per-window median is 13.4 FPS, 74.63 ms/frame, 26.89 ms busy, and 47.35 ms gap. Each interval reported `full-drain=0`, `blocked-poll=0`, `gpu-thread-idle=0`, and `#UD=0`. `tick-wait` was 1.69, 2.06, and 1.71 ms/frame; `submit` was 1.17, 1.19, and 1.15 ms/frame; queue-lock wait was 0.00 ms/frame after rounding. `suspend-wait` was 54.01, 54.12, and 53.14 ms/frame. These CPU synchronization counters overlap other work and are not additive to frame time or GPU gap.
+
+Five one-second `nvidia-smi` samples during the held scene reported GPU utilization of 33%, 46%, 39%, 37%, and 34% (mean 37.8%). The same samples showed 14,908–14,916 MiB used of 16,376 MiB, 1,050–1,290 MHz graphics clocks, and 65–66 C. This is device-wide WDDM telemetry, not per-process utilization or a direct substitute for Kyty's GPU timestamps. No equivalent Optimus utilization samples exist, so it cannot establish a mode-to-mode utilization change.
+
+### Comparison and interpretation
+
+| Metric | Optimus Run A | dGPU-only | Absolute change | Relative change |
+|---|---:|---:|---:|---:|
+| FPS | 12.20 | 13.47 | +1.27 | +10.4% |
+| Frame time | 81.97 ms | 74.26 ms | -7.71 ms | -9.4% |
+| GPU busy | 25.41 ms/frame | 26.99 ms/frame | +1.58 ms | +6.2% |
+| GPU gap | 56.45 ms/frame | 47.25 ms/frame | -9.20 ms | -16.3% |
+
+Changes use `(dGPU-only - Optimus) / Optimus`. The dGPU capture's busy-plus-gap is 74.24 ms/frame, close to its 74.26 ms implied frame time. In the Optimus reference, busy plus gap was 81.86 ms/frame versus 81.97 ms implied. Timestamped GPU busy rose while timestamped gap fell. The result is therefore not a simple GPU execution-speed increase: most of the observed frame-time reduction coincides with a smaller gap between timestamped GPU command-buffer intervals.
+
+**MEASURED:** the GPU gap remains large at 47.25 ms/frame in dGPU-only mode, although it is 9.20 ms/frame (16.3%) lower than normal-profile Optimus Run A. Timestamped GPU busy is 1.58 ms/frame (6.2%) higher; FPS is 10.4% higher. The fast Intel instruction path remains healthy at zero illegal-instruction traps.
+
+**MEASURED:** dGPU-only `gpu-thread-idle`, `blocked-poll`, and `full-drain` remain zero, and `tick-wait` and `submit` remain around 1–2 ms/frame. These counters do not attribute each GPU gap to a specific producer, wait, or presentation event. The 53.75 ms/frame combined `suspend-wait` is a separate guest synchronization measure; it overlaps other work and cannot be assigned as the cause of the GPU gap. Optimus Run A's accepted windows averaged about 60.26 ms/frame for this counter, but the difference is not a per-gap correlation.
+
+**INFERRED:** this capture supports a moderate graphics-topology-associated effect: dGPU-only mode reduced GPU gap and frame time while increasing measured GPU execution. It does not identify presentation-copy overhead or another specific mechanism. The measured improvement is not large enough to explain the remaining low frame rate; the GPU timestamp gap still accounts for about 63.6% of the implied dGPU frame interval.
+
+**LIMITATION:** this is one sequential capture per graphics mode, with three adjacent windows in each. The scene was visually matched by Rajiv's hold confirmation, but no coordinates or dGPU screenshot establish identical scene state. Scene-work variation, clocks/power state, and run order remain possible contributors. The prior diagnostics-enabled Optimus capture also showed a gap near 46.67 ms/frame, demonstrating that a similar value occurred in a separate Optimus run; because it had extra diagnostics and no exact B position confirmation, it is not a clean counterexample or control.
+
+### Decision
+
+```text
+DEDICATED-NVIDIA A/B RESULT:
+
+OPTIMUS REFERENCE:
+FPS: 12.20
+FRAME MS: 81.97
+GPU BUSY: 25.41 ms/frame
+GPU GAP: 56.45 ms/frame
+
+DGPU-ONLY:
+FPS: 13.47
+FRAME MS: 74.26
+GPU BUSY: 26.99 ms/frame
+GPU GAP: 47.25 ms/frame
+
+GPU GAP CHANGE:
+-9.20 ms / -16.3%
+
+GPU BUSY CHANGE:
++1.58 ms / +6.2%
+
+BOTTLENECK CLASSIFICATION AFTER A/B:
+MIXED: moderate topology-associated change measured, with a large unexplained GPU queue gap persisting.
+
+OPTIMUS CONTRIBUTION:
+SUPPORTED (moderate association in this capture; specific mechanism and repeatability unproven)
+
+NEXT INVESTIGATION:
+Correlate per-gap GPU timestamp boundaries with producer availability, Thread_Gpu state, and record/submit queue depth in the held dGPU-only Sky Garden scene.
+```
