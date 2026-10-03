@@ -962,10 +962,17 @@ void RecordImageChunks(uint64_t address, uint64_t size) noexcept {
 }
 
 void DrawPhaseTimer::End(uint64_t pixel_hash) {
+	if (active) {
+		Mark(Tail);
+	}
+	if (trace_active) {
+		const auto now_ns = GpuGapTrace::NowNs();
+		TracePhase(trace_phase, now_ns, now_ns - trace_last_ns);
+		trace_active = false;
+	}
 	if (!active) {
 		return;
 	}
-	Mark(Tail);
 	active = false;
 	static constexpr std::array<const char*, Count> Names {
 	    "setup",    "vs-params", "ps-params",  "ps-program", "vs-program", "targets",  "stage-tex",

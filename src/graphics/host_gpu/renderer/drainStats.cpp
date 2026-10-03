@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/drainStats.h"
+#include "graphics/host_gpu/renderer/gpuGapTrace.h"
 
 #include "common/logging/log.h"
 #include "kernel/pthread.h"
@@ -502,10 +503,12 @@ void Run(std::stop_token stop, uint32_t interval_seconds) {
 				Report(first, current,
 				       std::chrono::duration<double>(current_time - start).count(), false);
 			}
+			GpuGapTrace::SnapshotAndWrite();
 			break;
 		}
 		Report(previous, current,
 		       std::chrono::duration<double>(current_time - previous_time).count());
+		GpuGapTrace::SnapshotAndWrite();
 		previous      = std::move(current);
 		previous_time = current_time;
 	}

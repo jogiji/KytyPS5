@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandHooks.h"
+#include "graphics/host_gpu/renderer/gpuGapTrace.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -395,6 +396,8 @@ struct CommandStream::Impl {
 		uint32_t size              = 0;       // The whole packet.
 		uint32_t closure_offset    = 0;       // From the header; the closure follows the arrays.
 	};
+	enum PacketKind : uint32_t { RecordCall = 0, SubmitJob = 1 };
+	static constexpr uint32_t SubmitTag = 0x80000000u;
 	static constexpr size_t RingBytes    = size_t {64} << 20u;
 	static constexpr size_t Align        = 16;
 	static constexpr size_t ClosureBytes = 176;
@@ -410,6 +413,7 @@ struct CommandStream::Impl {
 	// Only the stream's owner (see Slot) appends.
 	uint64_t              pending_write = 0; // Owner: bytes reserved, not yet published.
 	uint64_t              wake_mark     = 0;
+	uint64_t              last_trace_ns = 0; // Owner only; rate limits queue-depth samples.
 
 	// Reserves a packet of `bytes` (header and closure included) and returns its start.
 	uint8_t* Reserve(size_t bytes) {
@@ -429,11 +433,22 @@ struct CommandStream::Impl {
 		return ring.data() + offset;
 	}
 	void WaitForSpace(size_t bytes) {
+		const auto start = GpuGapTrace::Enabled() ? GpuGapTrace::NowNs() : 0;
+		bool blocked = false;
 		while (pending_write + bytes - read.load(std::memory_order_acquire) > RingBytes) {
+			if (!blocked && start != 0) {
+				blocked = true;
+				GpuGapTrace::Instant(GpuGapTrace::Event::StreamBackpressureBegin,
+				                     pending_write - read.load(std::memory_order_relaxed), bytes);
+			}
 			if (sleeping.load(std::memory_order_seq_cst)) {
 				Signal();
 			}
 			std::this_thread::yield();
+		}
+		if (blocked) {
+			GpuGapTrace::Instant(GpuGapTrace::Event::StreamBackpressureEnd,
+			                     pending_write - read.load(std::memory_order_relaxed), bytes);
 		}
 	}
 	void Publish(uint8_t* start, size_t bytes) {
@@ -441,10 +456,29 @@ struct CommandStream::Impl {
 		EXIT_IF(start != ring.data() + pending_write % RingBytes);
 		pending_write += bytes;
 		packets.store(packets.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		if (GpuGapTrace::Enabled()) {
+			auto* header = reinterpret_cast<Header*>(start);
+			if ((header->closure_offset & SubmitTag) != 0) {
+				pending_submit_packets.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				pending_record_packets.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
 		// A plain store: a consumer about to sleep is checked for only every WakeBytes (and on
 		// Wake and Drain), each after a fence ordering it with the consumer's "sleeping, then
 		// check write".
 		write.store(pending_write, std::memory_order_release);
+		if (GpuGapTrace::Enabled()) {
+			const auto now = GpuGapTrace::NowNs();
+			// The empty-before-publish case can occur for nearly every host record. Keep
+			// queue-depth samples periodic so tracing does not fill the per-thread ring.
+			if (last_trace_ns == 0 || now - last_trace_ns >= 50000000) {
+				GpuGapTrace::Instant(GpuGapTrace::Event::StreamDepthSample,
+				                     pending_write - read.load(std::memory_order_relaxed),
+			                     pending_record_packets.load(std::memory_order_relaxed));
+				last_trace_ns = now;
+			}
+		}
 		if (pending_write - wake_mark >= WakeBytes) {
 			wake_mark = pending_write;
 			WakeIfSleeping();
@@ -468,6 +502,9 @@ struct CommandStream::Impl {
 	std::atomic<uint64_t> wakes {0};
 	std::atomic<uint64_t> drains {0};
 	std::atomic<uint64_t> sleeps {0};
+	std::atomic<uint64_t> submit_jobs {0};
+	std::atomic<uint64_t> pending_record_packets {0};
+	std::atomic<uint64_t> pending_submit_packets {0};
 };
 
 // Streams by the command buffer each routes. A slot's stream is created once and kept for the
@@ -590,7 +627,7 @@ template <typename T>
 
 // Builds one packet: copies of arrays, then the closure that makes the call.
 // Publishes a reserved packet: its header, then `call` at `closure` (after its arrays).
-template <typename Call>
+template <CommandStream::Impl::PacketKind Kind, typename Call>
 void CommitCall(CommandStream::Impl& stream, uint8_t* start, uint8_t* closure, Call call) {
 	static_assert(std::is_trivially_destructible_v<Call>);
 	static_assert(sizeof(Call) <= CommandStream::Impl::ClosureBytes);
@@ -598,6 +635,11 @@ void CommitCall(CommandStream::Impl& stream, uint8_t* start, uint8_t* closure, C
 	::new (closure) Call(call);
 	header->run            = [](void* bytes) { (*static_cast<Call*>(bytes))(); };
 	header->closure_offset = static_cast<uint32_t>(closure - start);
+	if constexpr (Kind == CommandStream::Impl::SubmitJob) {
+		if (GpuGapTrace::Enabled()) {
+		header->closure_offset |= CommandStream::Impl::SubmitTag;
+		}
+	}
 	const auto used        = static_cast<size_t>(closure - start) + sizeof(Call);
 	header->size = static_cast<uint32_t>((used + CommandStream::Impl::Align - 1) &
 	                                     ~(CommandStream::Impl::Align - 1));
@@ -627,7 +669,11 @@ public:
 
 	template <typename Call>
 	void Commit(Call call) {
-		CommitCall(m_stream, m_start, m_next, call);
+		CommitCall<CommandStream::Impl::RecordCall>(m_stream, m_start, m_next, call);
+	}
+	template <typename Call>
+	void CommitSubmit(Call call) {
+		CommitCall<CommandStream::Impl::SubmitJob>(m_stream, m_start, m_next, call);
 	}
 
 private:
@@ -1530,8 +1576,9 @@ void CommitRecordedCall(void (*run)(VkCommandBuffer buffer, const uint8_t* paylo
 	const auto call = std::exchange(t_pending_call, {});
 	EXIT_IF(call.stream == nullptr || run == nullptr);
 	const auto* payload = call.start + CommandStream::Impl::HeaderBytes;
-	CommitCall(*call.stream, call.start, call.closure,
-	           [run, buffer = call.buffer, payload] { run(buffer, payload); });
+	CommitCall<CommandStream::Impl::RecordCall>(
+	    *call.stream, call.start, call.closure,
+	    [run, buffer = call.buffer, payload] { run(buffer, payload); });
 }
 
 CommandStream::CommandStream() {
@@ -1568,8 +1615,21 @@ void CommandStream::Route(VkCommandBuffer buffer) {
 
 void CommandStream::Push(Common::UniqueFunction<void>&& call) {
 	auto*  heap = new Common::UniqueFunction<void>(std::move(call));
+	const bool trace = GpuGapTrace::Enabled();
+	const auto queued = trace ? m_impl->submit_jobs.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+	if (trace) {
+		GpuGapTrace::Instant(GpuGapTrace::Event::SubmitQueued, queued,
+		                     m_impl->write.load(std::memory_order_acquire) -
+	                         m_impl->read.load(std::memory_order_relaxed));
+	}
 	Packet packet(*m_impl, 0);
-	packet.Commit([heap] {
+	packet.CommitSubmit([heap, impl = m_impl, trace] {
+		if (trace) {
+			const auto remaining = impl->submit_jobs.fetch_sub(1, std::memory_order_relaxed) - 1;
+			GpuGapTrace::Instant(GpuGapTrace::Event::SubmitDequeued, remaining,
+			                     impl->write.load(std::memory_order_acquire) -
+		                         impl->read.load(std::memory_order_relaxed));
+		}
 		(*heap)();
 		delete heap;
 	});
@@ -1611,9 +1671,30 @@ void CommandStream::Consume(std::stop_token stop) {
 	auto&    impl     = *m_impl;
 	uint64_t position = impl.read.load(std::memory_order_relaxed);
 	t_consuming       = &impl;
+	GpuGapTrace::Instant(GpuGapTrace::Event::ThreadRole, 2, 0);
+	bool empty_reported = false;
+	bool record_batch_active = false;
+	uint64_t empty_start_ns = 0;
+	uint64_t record_batch_start_ns = 0;
+	uint64_t last_trace_ns = 0;
+	constexpr uint64_t TraceSampleIntervalNs = 50000000;
+	constexpr uint64_t TraceMinSpanNs = 250000;
 	for (;;) {
 		const auto available = impl.write.load(std::memory_order_acquire);
 		if (position == available) {
+			if (record_batch_active) {
+				const auto end_ns = GpuGapTrace::NowNs();
+				if (end_ns - record_batch_start_ns >= TraceMinSpanNs) {
+					GpuGapTrace::Span(GpuGapTrace::Event::RecordBatchBegin,
+					                  GpuGapTrace::Event::RecordBatchEnd, record_batch_start_ns,
+					                  impl.pending_record_packets.load(std::memory_order_relaxed), 0);
+				}
+				record_batch_active = false;
+			}
+			if (!empty_reported && GpuGapTrace::Enabled()) {
+				empty_start_ns = GpuGapTrace::NowNs();
+				empty_reported = true;
+			}
 			if (stop.stop_requested()) {
 				return;
 			}
@@ -1640,13 +1721,61 @@ void CommandStream::Consume(std::stop_token stop) {
 			impl.sleeping.store(false, std::memory_order_relaxed);
 			continue;
 		}
+		if (empty_reported) {
+			const auto end_ns = GpuGapTrace::NowNs();
+			if (GpuGapTrace::Enabled() && end_ns - empty_start_ns >= TraceMinSpanNs) {
+				GpuGapTrace::Span(GpuGapTrace::Event::StreamEmptyBegin,
+				                  GpuGapTrace::Event::StreamEmptyEnd, empty_start_ns,
+				                  available - position,
+				                  impl.pending_record_packets.load(std::memory_order_relaxed));
+				GpuGapTrace::Span(GpuGapTrace::Event::StreamConsumeEnd,
+				                  GpuGapTrace::Event::StreamConsumeBegin, empty_start_ns,
+				                  impl.pending_record_packets.load(std::memory_order_relaxed),
+				                  impl.submit_jobs.load(std::memory_order_relaxed));
+			}
+			empty_reported = false;
+		}
+		const auto now_ns = GpuGapTrace::Enabled() ? GpuGapTrace::NowNs() : 0;
+		if (now_ns != 0 && (last_trace_ns == 0 || now_ns - last_trace_ns >= TraceSampleIntervalNs)) {
+			GpuGapTrace::Instant(GpuGapTrace::Event::StreamDepthSample,
+			                     available - position,
+			                     impl.pending_record_packets.load(std::memory_order_relaxed));
+			GpuGapTrace::Instant(GpuGapTrace::Event::SubmitQueueSample,
+			                     impl.submit_jobs.load(std::memory_order_relaxed),
+			                     impl.pending_submit_packets.load(std::memory_order_relaxed));
+			last_trace_ns = now_ns;
+		}
 		auto* start  = impl.ring.data() + position % Impl::RingBytes;
 		auto* header = reinterpret_cast<Impl::Header*>(start);
 		if (header->run == nullptr) {
 			// Skip to the ring's start.
 			position += Impl::RingBytes - position % Impl::RingBytes;
 		} else {
+		if (GpuGapTrace::Enabled()) {
+			const auto kind = (header->closure_offset & Impl::SubmitTag) != 0
+			                      ? Impl::SubmitJob
+			                      : Impl::RecordCall;
+			if (kind == Impl::RecordCall && !record_batch_active) {
+				record_batch_start_ns = GpuGapTrace::NowNs();
+				record_batch_active = true;
+			} else if (kind == Impl::SubmitJob && record_batch_active) {
+				const auto end_ns = GpuGapTrace::NowNs();
+				if (end_ns - record_batch_start_ns >= TraceMinSpanNs) {
+					GpuGapTrace::Span(GpuGapTrace::Event::RecordBatchBegin,
+					                  GpuGapTrace::Event::RecordBatchEnd, record_batch_start_ns,
+					                  impl.pending_record_packets.load(std::memory_order_relaxed), 0);
+				}
+				record_batch_active = false;
+			}
+			header->run(start + (header->closure_offset & ~Impl::SubmitTag));
+			if (kind == Impl::SubmitJob) {
+				impl.pending_submit_packets.fetch_sub(1, std::memory_order_relaxed);
+			} else {
+				impl.pending_record_packets.fetch_sub(1, std::memory_order_relaxed);
+			}
+		} else {
 			header->run(start + header->closure_offset);
+		}
 			position += header->size;
 		}
 		impl.read.store(position, std::memory_order_release);

@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DEBUG_H_
 
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/gpuGapTrace.h"
 
 #include <array>
 #include <atomic>
@@ -159,6 +160,12 @@ struct DrawPhaseTimer {
 	static uint64_t Hash();
 	// The time stamp counter the phases are measured in.
 	static uint64_t Now();
+	static void TracePhase(uint32_t phase, uint64_t end_ns, uint64_t duration_ns) {
+		constexpr uint64_t MinPhaseNs = 250000;
+		if (duration_ns >= MinPhaseNs) {
+			GpuGapTrace::DurationAt(GpuGapTrace::Event::DrawPhaseSlow, end_ns, duration_ns, phase);
+		}
+	}
 	// auto_draw: a DRAW_INDEX_AUTO packet's draw, also accounted on its own line.
 	void            Begin(bool auto_draw = false) {
 		if (Hash() != 0) [[unlikely]] {
@@ -168,12 +175,24 @@ struct DrawPhaseTimer {
 			probes.fill(0);
 			last = Now();
 		}
+		static thread_local uint32_t trace_draw_counter = 0;
+		trace_active = GpuGapTrace::Enabled() && ((trace_draw_counter++ & 15u) == 0);
+		if (trace_active) {
+			trace_phase = Setup;
+			trace_last_ns = GpuGapTrace::NowNs();
+		}
 	}
 	void Mark(Phase phase) {
 		if (active) [[unlikely]] {
 			const auto now = Now();
 			current[phase] += now - last;
 			last = now;
+		}
+		if (trace_active) [[unlikely]] {
+			const auto now_ns = GpuGapTrace::NowNs();
+			TracePhase(trace_phase, now_ns, now_ns - trace_last_ns);
+			trace_phase = phase;
+			trace_last_ns = now_ns;
 		}
 	}
 	// Accounts the draw if its pixel shader is the one timed.
@@ -187,6 +206,9 @@ private:
 	uint64_t                         last      = 0;
 	std::array<uint64_t, Count>      current {};
 	std::array<uint64_t, ProbeCount> probes {};
+	bool                             trace_active = false;
+	uint32_t                         trace_phase = Setup;
+	uint64_t                         trace_last_ns = 0;
 };
 inline thread_local DrawPhaseTimer g_draw_phases;
 

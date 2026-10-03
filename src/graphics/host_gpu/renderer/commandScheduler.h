@@ -147,10 +147,13 @@ private:
 	void                      WriteStartTimestamp();
 	void                      WriteEndTimestamp();
 	void                      ReadTimestamps(uint32_t slot);
+	void                      RefreshGpuClockMapping();
 	vk::QueryPool             m_timestamp_pool = nullptr;
 	uint32_t                  m_timestamp_next = 0;
 	uint32_t                  m_timestamp_slot = UINT32_MAX; // Slot of the recording buffer.
 	uint64_t                  m_gpu_last_end   = 0;          // Latest end seen, in ticks.
+	uint64_t                  m_last_gpu_calibration_ns = 0;
+	bool                      m_gpu_calibration_unavailable_reported = false;
 	// KYTY_GPU_ZONES=1 with --drain-stats: a timestamp at each change of zone (gpuZones.h) in
 	// the recording buffer. Each buffer takes one chunk of the pool, reset when it begins, and
 	// its intervals are read once its tick completes.

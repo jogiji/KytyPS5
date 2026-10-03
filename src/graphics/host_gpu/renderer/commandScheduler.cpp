@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/gpuGapTrace.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -544,6 +545,7 @@ void CommandScheduler::ReadTimestamps(uint32_t slot) {
 		return;
 	}
 	const double period = m_graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+	RefreshGpuClockMapping();
 	const auto   to_ns  = [period](uint64_t ticks) {
         return static_cast<uint64_t>(static_cast<double>(ticks) * period);
 	};
@@ -551,6 +553,17 @@ void CommandScheduler::ReadTimestamps(uint32_t slot) {
 	const auto [start, end] = std::pair {values[0], values[1]};
 	if (m_gpu_last_end != 0 && start > m_gpu_last_end) {
 		DrainStats::Record(DrainStats::Kind::GpuGap, to_ns(start - m_gpu_last_end));
+		if (GpuGapTrace::Enabled()) {
+			uint64_t gap_start_ns = 0;
+			uint64_t gap_end_ns = 0;
+			uint64_t deviation_ns = 0;
+			uint64_t end_deviation_ns = 0;
+			if (GpuGapTrace::GpuTicksToNs(m_gpu_last_end, gap_start_ns, deviation_ns) &&
+			    GpuGapTrace::GpuTicksToNs(start, gap_end_ns, end_deviation_ns)) {
+				GpuGapTrace::GpuGap(gap_start_ns, gap_end_ns,
+				                    std::max(deviation_ns, end_deviation_ns));
+			}
+		}
 	}
 	const auto from = std::max(start, m_gpu_last_end);
 	if (end > from) {
@@ -558,6 +571,43 @@ void CommandScheduler::ReadTimestamps(uint32_t slot) {
 		g_gpu_busy_ns.fetch_add(to_ns(end - from), std::memory_order_relaxed);
 	}
 	m_gpu_last_end = std::max(m_gpu_last_end, end);
+}
+
+void CommandScheduler::RefreshGpuClockMapping() {
+	if (!GpuGapTrace::Enabled()) {
+		return;
+	}
+	const auto now = GpuGapTrace::NowNs();
+	if (m_last_gpu_calibration_ns != 0 && now - m_last_gpu_calibration_ns < 1000000000ull) {
+		return;
+	}
+	m_last_gpu_calibration_ns = now;
+	const auto get_calibrated = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetCalibratedTimestampsEXT;
+	if (get_calibrated == nullptr) {
+		if (!m_gpu_calibration_unavailable_reported) {
+			GpuGapTrace::Instant(GpuGapTrace::Event::ClockCalibrationFailure, 0, 0);
+			m_gpu_calibration_unavailable_reported = true;
+		}
+		return;
+	}
+	VkCalibratedTimestampInfoKHR infos[2] {};
+	infos[0].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+	infos[0].timeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
+	infos[1].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+	infos[1].timeDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+	uint64_t timestamps[2] {};
+	uint64_t deviation_ns = 0;
+	const auto result = get_calibrated(static_cast<VkDevice>(m_graphics.device), 2, infos, timestamps,
+	                                   &deviation_ns);
+	if (result == VK_SUCCESS) {
+		GpuGapTrace::SetGpuClockMapping(timestamps[0],
+		                               GpuGapTrace::HostCounterToNs(timestamps[1]),
+		                               m_graphics.GetPhysicalDeviceProperties().limits.timestampPeriod,
+				                               deviation_ns);
+	} else {
+		GpuGapTrace::Instant(GpuGapTrace::Event::ClockCalibrationFailure,
+		                     static_cast<uint64_t>(result), deviation_ns);
+	}
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
@@ -606,6 +656,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		job.tick = m_master.NextTick();
 		job.submit.AddSignal(m_master.Handle(), job.tick);
 		m_submit_jobs.push_back(job);
+		if (GpuGapTrace::Enabled()) {
+			GpuGapTrace::Instant(GpuGapTrace::Event::SubmitQueued, m_submit_jobs.size(), 0);
+		}
 	}
 	m_submit_available.notify_one();
 	return job.tick;
@@ -654,7 +707,15 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
+		if (GpuGapTrace::Enabled()) {
+			GpuGapTrace::Instant(GpuGapTrace::Event::SubmitBegin, submit_info.waitSemaphoreCount,
+			                     submit_info.signalSemaphoreCount);
+		}
 		result = graphics.queue.submit(1, &submit_info, nullptr);
+		if (GpuGapTrace::Enabled()) {
+			GpuGapTrace::Instant(GpuGapTrace::Event::SubmitEnd, submit_info.waitSemaphoreCount,
+			                     submit_info.signalSemaphoreCount);
+		}
 	}
 	if (stats) {
 		DrainStats::Record(DrainStats::Kind::Submit, reason, job.pm4_op, elapsed_ns());
@@ -702,6 +763,9 @@ void CommandScheduler::SubmitThread(std::stop_token stop) {
 			}
 			job = m_submit_jobs.front();
 			m_submit_jobs.pop_front();
+			if (GpuGapTrace::Enabled()) {
+				GpuGapTrace::Instant(GpuGapTrace::Event::SubmitDequeued, m_submit_jobs.size(), 0);
+			}
 		}
 		QueueSubmit(job);
 	}

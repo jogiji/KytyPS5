@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/gpuGapTrace.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -178,7 +179,10 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_commands.push_back(std::move(command));
-	m_pending_commands.fetch_add(1, std::memory_order_release);
+	const auto pending = m_pending_commands.fetch_add(1, std::memory_order_release) + 1;
+	if (GpuGapTrace::Enabled()) {
+		GpuGapTrace::Instant(GpuGapTrace::Event::ProducerCommandEnqueue, pending, 0);
+	}
 	m_work_available.Signal();
 }
 
@@ -191,7 +195,12 @@ void GuestGpu::ProcessCommands() {
 			EXIT_IF(m_commands.empty());
 			command = std::move(m_commands.front());
 			m_commands.pop_front();
-			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
+			const auto previous_pending = m_pending_commands.fetch_sub(1, std::memory_order_acq_rel);
+			EXIT_IF(previous_pending == 0);
+			const auto pending = previous_pending - 1;
+			if (GpuGapTrace::Enabled()) {
+				GpuGapTrace::Instant(GpuGapTrace::Event::ProducerCommandDequeue, pending, 0);
+			}
 		}
 		// Commands run between packets on behalf of other threads.
 		DrainStats::Pm4OpScope op(DrainStats::NoPm4Op);
@@ -569,12 +578,16 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
+	const auto queue_id = submission.queue_id;
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	submission.sequence = m_next_sequence++;
 	m_outstanding.insert(submission.sequence);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
+	if (GpuGapTrace::Enabled()) {
+		GpuGapTrace::Instant(GpuGapTrace::Event::ProducerEnqueue, m_submission_count, queue_id);
+	}
 	m_work_available.Signal();
 }
 
@@ -582,7 +595,15 @@ void GuestGpu::WaitForIdle() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	Common::LockGuard lock(m_queue_mutex);
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
+		if (GpuGapTrace::Enabled()) {
+			GpuGapTrace::Instant(GpuGapTrace::Event::ProducerIdleWaitBegin, m_submission_count,
+			                     m_pending_commands.load(std::memory_order_relaxed));
+		}
 		m_idle.Wait(&m_queue_mutex);
+		if (GpuGapTrace::Enabled()) {
+			GpuGapTrace::Instant(GpuGapTrace::Event::ProducerIdleWaitEnd, m_submission_count,
+			                     m_pending_commands.load(std::memory_order_relaxed));
+		}
 	}
 }
 
@@ -591,6 +612,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	GpuGapTrace::Instant(GpuGapTrace::Event::ThreadRole, 1, 0);
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 	StartThreadSampler("gpu");
@@ -616,13 +638,23 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			Common::LockGuard                    lock(gpu->m_queue_mutex);
 			std::optional<DrainStats::WaitTimer> idle;
+			uint64_t idle_start_ns = 0;
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				if (!idle) {
 					idle.emplace(DrainStats::Kind::GpuThreadIdle);
+					if (GpuGapTrace::Enabled()) {
+						idle_start_ns = GpuGapTrace::NowNs();
+						GpuGapTrace::Instant(GpuGapTrace::Event::ThreadGpuIdleBegin,
+						                     gpu->m_submission_count, gpu->m_pending_commands.load());
+					}
 				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+			}
+			if (idle_start_ns != 0) {
+				GpuGapTrace::Instant(GpuGapTrace::Event::ThreadGpuIdleEnd,
+				                     gpu->m_submission_count, gpu->m_pending_commands.load());
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -631,7 +663,13 @@ void GuestGpu::ThreadRun(void* data) {
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
 				gpu->m_commands.pop_front();
-				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
+				const auto previous_pending =
+				    gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel);
+				EXIT_IF(previous_pending == 0);
+				const auto pending = previous_pending - 1;
+				if (GpuGapTrace::Enabled()) {
+					GpuGapTrace::Instant(GpuGapTrace::Event::ProducerCommandDequeue, pending, 0);
+				}
 				gpu->m_processing = true;
 			} else {
 				int selected_queue = -1;
@@ -644,8 +682,17 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					const auto blocked_start = GpuGapTrace::Enabled() ? GpuGapTrace::NowNs() : 0;
+					if (blocked_start != 0) {
+						GpuGapTrace::Instant(GpuGapTrace::Event::ThreadGpuBlockedBegin,
+						                     gpu->m_submission_count, gpu->m_commands.size());
+					}
 					DrainStats::WaitTimer poll(DrainStats::Kind::BlockedPoll);
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					if (blocked_start != 0) {
+						GpuGapTrace::Instant(GpuGapTrace::Event::ThreadGpuBlockedEnd,
+						                     gpu->m_submission_count, gpu->m_commands.size());
+					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -657,6 +704,10 @@ void GuestGpu::ThreadRun(void* data) {
 				submission  = std::move(queue.front());
 				queue.pop_front();
 				gpu->m_submission_count--;
+				if (GpuGapTrace::Enabled()) {
+					GpuGapTrace::Instant(GpuGapTrace::Event::ProducerDequeue,
+					                     gpu->m_submission_count, static_cast<uint64_t>(selected_queue));
+				}
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
 				has_submission    = true;
@@ -671,7 +722,14 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			const auto process_start = GpuGapTrace::Enabled() ? GpuGapTrace::NowNs() : 0;
+			if (process_start != 0) {
+				GpuGapTrace::Instant(GpuGapTrace::Event::ThreadGpuProcessBegin, 1, 0);
+			}
 			command();
+			if (process_start != 0) {
+				GpuGapTrace::Instant(GpuGapTrace::Event::ThreadGpuProcessEnd, 1, 0);
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -682,7 +740,14 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
+		const auto process_start = GpuGapTrace::Enabled() ? GpuGapTrace::NowNs() : 0;
+		if (process_start != 0) {
+			GpuGapTrace::Instant(GpuGapTrace::Event::ThreadGpuProcessBegin, 2, submission.queue_id);
+		}
 		const bool complete = gpu->Process(submission);
+		if (process_start != 0) {
+			GpuGapTrace::Instant(GpuGapTrace::Event::ThreadGpuProcessEnd, 2, submission.queue_id);
+		}
 		if (debug_queues) {
 			auto& stats = queue_stats[submission.queue_id];
 			if (complete) {
@@ -939,6 +1004,20 @@ static bool IsDispatchOpcode(uint32_t opcode) {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	struct TraceScope {
+		uint64_t start = 0;
+		TraceScope() {
+			if (GpuGapTrace::Enabled()) {
+				start = GpuGapTrace::NowNs();
+				GpuGapTrace::Instant(GpuGapTrace::Event::Pm4Begin);
+			}
+		}
+		~TraceScope() {
+			if (start != 0) {
+				GpuGapTrace::Instant(GpuGapTrace::Event::Pm4End);
+			}
+		}
+	} trace_scope;
 	// KYTY_DEBUG_DRAW_PHASES: the time in each handler and between them (see Pm4OpTimer).
 	static const bool timed       = DrawPhaseTimer::Hash() != 0;
 	uint64_t          handler_end = 0;
@@ -1032,6 +1111,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			t_speculated_draw = m_speculator->Take(packet);
 		}
 		uint64_t handler_start = 0;
+		uint64_t trace_handler_start = 0;
+		if (GpuGapTrace::Enabled() && draw) {
+			trace_handler_start = GpuGapTrace::NowNs();
+		}
 		if (timed) [[unlikely]] {
 			handler_start = DrawPhaseTimer::Now();
 			if (handler_end != 0) {
@@ -1041,6 +1124,17 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		if (trace_handler_start != 0) {
+			const auto end_ns = GpuGapTrace::NowNs();
+			const auto duration_ns = end_ns - trace_handler_start;
+			constexpr uint64_t MinHandlerNs = 250000;
+			if (duration_ns >= MinHandlerNs) {
+				GpuGapTrace::DurationAt(
+				    IsDispatchOpcode(opcode) ? GpuGapTrace::Event::Pm4DispatchHandlerSlow
+				                            : GpuGapTrace::Event::Pm4DrawHandlerSlow,
+				    end_ns, duration_ns, opcode);
+			}
+		}
 		if (timed) [[unlikely]] {
 			handler_end       = DrawPhaseTimer::Now();
 			const auto ticks = handler_end - handler_start;

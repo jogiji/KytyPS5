@@ -627,6 +627,11 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/V
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+add_executable(gpu_gap_trace_tests
+	"${KYTY_TESTS_DIR}/GpuGapTraceTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/gpuGapTrace.cpp")
+target_include_directories(gpu_gap_trace_tests PRIVATE ${KYTY_SOURCE_DIR})
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
@@ -698,7 +703,9 @@ if(BUILD_TESTING)
 	add_test(NAME graphics_draw_offsets
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation
-		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	         COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	add_test(NAME gpu_gap_trace COMMAND $<TARGET_FILE:gpu_gap_trace_tests>)
+	set_tests_properties(gpu_gap_trace PROPERTIES ENVIRONMENT "KYTY_GPU_GAP_TRACE=0")
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline

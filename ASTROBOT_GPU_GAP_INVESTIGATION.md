@@ -1,6 +1,6 @@
 # Astro Bot GPU Gap Investigation
 
-**Status:** profiling only; no emulator/runtime source changes.  
+**Status:** profiling-only instrumentation; no production behavior changes.
 **Capture date:** 2026-10-03.  
 **Evidence labels:** MEASURED, INFERRED, HYPOTHESIS.
 
@@ -8,7 +8,7 @@
 
 - Canonical source: `exp/astrobot-upstream-20261002` at `4ee64cba382050597ee7b25e1d9f4ad8c12d7c65`.
 - Investigation started from the certified profile commit `792e7da018576433252c1fc06051347fe8356376`; branch: `exp/astrobot-gpu-gap`.
-- The emulator binary was the existing `_Build/windows/install/kyty_emulator.exe`. No rebuild or runtime source change was made.
+- The initial profile used the installed `_Build/windows/install/kyty_emulator.exe`. This correlation follow-up added gated diagnostic instrumentation and rebuilt the diagnostic binary; no production graphics or synchronization semantics were changed.
 - The earlier profile measured an unnamed gameplay state at 10.73 FPS, 30.51 ms GPU busy and 62.78 ms GPU gap per frame. Rajiv had not identified that location, so those numbers are historical evidence, not a reproducible benchmark.
 
 ## 2. Reproducible heavy scene
@@ -329,4 +329,102 @@ SUPPORTED (moderate association in this capture; specific mechanism and repeatab
 
 NEXT INVESTIGATION:
 Correlate per-gap GPU timestamp boundaries with producer availability, Thread_Gpu state, and record/submit queue depth in the held dGPU-only Sky Garden scene.
+```
+
+## GPU Gap Critical-Path Correlation
+
+### Capture and exact configuration
+
+**MEASURED:** the emulator ran visibly in dGPU-only mode on the NVIDIA RTX 4090, using `launch_gpu_gap_trace_dgpu_filtered.bat`, the same warm game/cache and the same runtime arguments as the established dGPU reference. Effective runtime options were `--gpu 0 --amd-cpu --redzone --rewrite-vrsqrtps true --rewrite-extrq true --dcc-gpu-clear true --async-submit true --gpu-mesh-indirect true --label-flush-interval-us 2000 --pipeline-libraries true --speculative-draws true --record-thread true --hardware-buffer-bounds true --relaxed-readback true --gpu-timestamp-scale 115 --drain-stats 1`, plus the game and patch paths in the batch file. The trace run added `KYTY_GPU_GAP_TRACE=1`, `KYTY_GPU_ZONES=1`, and the filtered trace policy: queue-depth sampling at 50 ms and retaining record-batch, empty-stream, and consumer spans only when at least 250 microseconds long. `--relaxed-readback true` remains the known performance-semantic relaxation, and was unchanged in both captures. No production behavior or graphics semantics were changed. The emulator was closed normally before analysis.
+
+**MEASURED:** the selected stable-position trace interval is QPC-nanoseconds `[22889352397300, 22904352397300)`, exactly 15 seconds. It contains 164 presents, zero `#UD` traps in each accepted one-second telemetry window, 304 clock calibrations in the full trace, maximum calibration deviation 55.328 microseconds, and zero cumulative ring drops. Loading and navigation were excluded. The character/camera match is based on Rajiv's visual hold confirmation, not numerical coordinates.
+
+### Instrumentation overhead A/B
+
+| Capture | Presents / time | FPS | Frame ms | GPU busy ms/frame | GPU gap ms/frame |
+|---|---:|---:|---:|---:|---:|
+| Normal dGPU reference | 202 / 15 s | 13.47 | 74.26 | 26.99 | 47.25 |
+| Filtered correlation trace | 164 / 15 s | 10.93 | 91.46 | 30.93 | 61.42 |
+
+**MEASURED:** with correlation tracing, FPS was 18.8% lower, implied frame time 17.20 ms higher, GPU busy 3.94 ms/frame higher, and GPU gap 14.17 ms/frame higher. The trace window also varied across its three consecutive 5-second groups: 12.8, 10.6, and 9.4 FPS. This is a material net capture effect. The comparison is sequential rather than simultaneous and scene coordinates were not recorded, so it does not isolate profiler overhead from scene/runtime variation. The trace should be used to classify the active pipeline state, not as the normal-profile performance number.
+
+### Gap and queue measurements
+
+**MEASURED:** the one-second telemetry for the selected interval aggregates to 164 presents in 15 seconds: 10.93 FPS, 91.46 ms implied frame time, 30.93 ms/frame GPU busy, and 61.42 ms/frame GPU gap. These drain-window GPU metrics are close in aggregate but are not exactly aligned to trace event boundaries.
+
+The timeline contains 4,618 positive-duration GPU-gap records totaling 9,524.938 ms. Their median duration is 0.0143 ms and p95 is 19.72 ms. The 403 gaps longer than 5 ms total 8,259.52 ms; mean duration is 20.495 ms, median 20.420 ms, and p95 27.289 ms. The longest was 30.148 ms. The trace event total divided by 164 presents is 58.08 ms of timestamped gap per present; the independent drain-stat average is 61.42 ms/frame. The approximately 3.34 ms/frame mismatch reflects different interval/accounting boundaries and is retained as uncertainty rather than forced to reconcile.
+
+| Queue/state | MEASURED result in selected interval | Meaning and limit |
+|---|---|---|
+| Guest GPU submissions awaiting Thread_Gpu | Event-updated depth time-weighted mean 11.40, peak 15; depth was zero for 29.7 ms of 15 s (0.20%). At gap starts, 4 of 4,618 samples were zero; mean depth 8.88, median 9. | Guest submission work was available through nearly all observed gaps. This is submission count, not PM4 packet count. |
+| Thread_Gpu callback/work queue | Pending callback depth was zero for 99.998% of the interval, peak 1; it was zero at every selected gap start. | This queue counts separately posted callbacks. It does not mean the main guest-submission queue was empty. |
+| Thread_Gpu execution | `thread_gpu_process` overlapped 9,523.318 ms of 9,524.938 ms of all captured positive GPU-gap durations (99.983%). PM4 spans on the same Thread_Gpu ID overlapped 9,503.950 ms (99.780%). | Direct temporal overlap on the GPU thread. Overlap supports association but alone does not prove causation. |
+| Host command-record stream | Periodic publish-time samples: 599, all nonzero; mean 1,052 bytes / 5.77 record packets, median 112 bytes / 1 packet, peak 22,912 bytes / 157 packets. Exact consumer-empty spans totaled 1,364.111 ms over 15 s (9.09%); 884.223 ms overlapped captured GPU gaps (9.28% of gap duration). | Publish-time samples are biased to publishing and cannot establish an empty fraction. Empty spans are the direct empty-time measure; record batches over the trace threshold overlapped only 1.797 ms of gaps. |
+| Async submit queue | 299 periodic samples; 297 showed zero jobs/packets, two showed one. It was empty in 4,587 of 4,619 gap-start states. | Sampled at 50 ms; the sample ratio is not exact empty duration. It provides no evidence of a sustained backlog waiting for the submitter. |
+
+At the start of each of the three longest gaps, the carried queue state was: guest submission depth 12, callback/work depth 0, command stream 112 bytes / one record packet, and submit queue 0. For the 30.148 ms example, same-thread PM4 processing overlapped 30.102 ms; command-stream consumer idle overlapped 0.716 ms; Vulkan submit overlapped 0.076 ms. Thus the GPU gap begins while guest submissions are pending and Thread_Gpu is processing PM4, with little downstream queued work.
+
+**MEASURED:** the analyzer finds 3,399 explicit semaphore waits totaling 14.945 seconds across all threads during the selected interval. None was on the identified Thread_Gpu ID, so same-thread semaphore-wait overlap with GPU gaps is zero. The earlier all-thread overlap is coincident activity and is not evidence that these waits caused the gaps. Vulkan submit CPU spans overlapped 86.608 ms of captured gap time (0.91%); record batches overlapped 1.797 ms. Submit time and queue-lock wait in the matched drain statistics averaged approximately 1.46 ms/frame and 0.01 ms/frame, respectively. `gpu-thread-idle`, `blocked-poll`, and `full-drain` were zero in the accepted telemetry windows.
+
+### PM4 and translation correlation
+
+**MEASURED:** same-thread PM4 spans occupy 9.504 seconds during the 9.525 seconds of captured positive GPU-gap duration. This equals 57.95 ms per present across 164 presents, or 99.78% of the trace's timestamped gap event duration. The broader `Thread_Gpu` processing span overlaps 99.983%. These are single-thread wall spans coincident with GPU timestamp gaps, not additive CPU totals.
+
+Slow-handler events are threshold-filtered samples, not complete PM4 accounting. In this window, the trace recorded 831 slow draw-handler events totaling 648.468 ms (3.95 ms per present), 48 slow dispatch-handler events totaling 21.205 ms (0.13 ms/present), and 41 slow draw-phase events totaling 41.264 ms (0.25 ms/present). These subsets cannot explain the remaining PM4 span and do not identify a specific opcode as the cause. In particular, opcode `0x35` was not independently established as the critical handler in this trace.
+
+**INFERRED:** the earliest likely limiting stage is Thread_Gpu PM4 processing and its production of downstream recorded/submitted host work. The guest submission queue is almost never empty and has a substantial backlog during gaps; meanwhile Thread_Gpu is active in PM4 processing, the record stream is shallow at gap starts, and the submit queue is almost always empty. Sustained CPU submit work, queue-lock contention, and Thread_Gpu idle do not explain the measured gap. The precise handoff between PM4 handling and command recording is not proven because stream samples are periodic/publish-biased and no per-buffer readiness marker directly links a specific PM4 packet to the next Vulkan timestamp interval.
+
+### Attribution table
+
+| Cause/state | ms/frame or share | Evidence and interpretation |
+|---|---:|---|
+| Thread_Gpu PM4 processing overlaps GPU timestamp gaps | 57.95 ms/present; 99.78% of captured gap duration | MEASURED temporal overlap, not a causal partition. |
+| Producer unavailable | 0.20% of interval empty; 4/4,618 gap starts empty | MEASURED from submission-depth transitions; producer starvation is not supported. |
+| Record consumer empty during gaps | 884.223 ms total; 9.28% of captured gap duration | MEASURED; overlaps the Thread_Gpu/PM4 spans and must not be added to them. |
+| Submit queue backlog / submit CPU spans | 32 positive gap-start samples; 86.608 ms submit-span overlap | MEASURED; no evidence of sustained submit-stage backlog. |
+| Thread_Gpu semaphore wait | 0 ms overlap | MEASURED same-thread matching; waits on unrelated threads excluded. |
+| Unattributed / exact causality | Not separated | PM4 overlap explains temporal state for almost all gap events, but does not prove which PM4 work or producer dependency caused each interval. |
+
+**INFERRED:** `Thread_Gpu PM4 processing → low downstream command/submit supply` is the leading explanation for why the GPU queue is often without timestamped work. The evidence partially attributes the gaps to that active stage, but does not confirm that translation/preparation consumes the entire GPU-idle critical path. The trace's material performance effect limits extrapolation to uninstrumented play.
+
+**HYPOTHESIS:** the high guest-submission backlog reflects PM4 processing throughput that cannot emit/record host work fast enough for the GPU. It is testable by opcode/handler-duration and per-command-buffer readiness correlation; the current trace does not identify the actionable handler.
+
+### Correlation result
+
+```text
+GPU GAP ROOT-CAUSE STATUS:
+PARTIALLY ATTRIBUTED
+
+DGPU REFERENCE:
+FPS: 13.47 (normal-profile reference; correlation run 10.93)
+FRAME MS: 74.26 (normal-profile reference; correlation run 91.46)
+GPU BUSY: 26.99 ms/frame (normal-profile reference; correlation run 30.93)
+GPU GAP: 47.25 ms/frame (normal-profile reference; correlation run 61.42)
+
+DOMINANT GAP STATE:
+Thread_Gpu actively processing PM4 while guest submissions remain queued and downstream submit depth is usually zero.
+
+FIRST STARVING PIPELINE BOUNDARY:
+Likely Thread_Gpu PM4 processing to host command-record/submit supply; the exact handoff is not proven.
+
+DOMINANT CRITICAL-PATH COST:
+57.95 ms/frame of same-thread PM4 overlap with captured GPU gaps
+
+PERCENT OF GPU GAP EXPLAINED:
+99.78% temporally overlapped by PM4 spans in the trace (not a causal percentage).
+
+TRANSLATION HYPOTHESIS:
+PARTIAL
+
+SUBMISSION BOTTLENECK:
+NOT SUPPORTED
+
+PRODUCER STARVATION:
+NOT SUPPORTED
+
+NEXT OPTIMIZATION TARGET:
+NONE — further attribution required; next investigation should identify which PM4 handlers delay downstream recorded/submitted work.
+
+CONFIDENCE:
+MEDIUM
 ```
