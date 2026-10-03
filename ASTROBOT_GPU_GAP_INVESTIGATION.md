@@ -151,3 +151,106 @@ Add one gated, low-overhead per-gap producer/consumer trace for the reproducible
 - Readback bytes/count are available, but readback wait duration is not. Full per-frame readback, GPU-fence dependency, lock and guest-producer critical-path attribution is unavailable.
 - This is an instrumented visible run. The cost of diagnostic instrumentation was not calibrated against a no-diagnostics control.
 - No emulator behavior, shaders, tiler, resolution, memory protection or synchronization settings were changed.
+
+## Optimus Baseline Reconciliation
+
+### Invocation and identity
+
+The historical profile and both reconciliation runs used the same game and patch paths and the same command-line arguments as `launch_test_combined_fastpath.bat`. The captures invoked the emulator directly from PowerShell rather than executing the `.bat` wrapper; arguments and the `KYTY_GPU_ZONES` setting matched. The batch wrapper itself only sets `KYTY_GPU_ZONES=1`, launches the emulator with these options, and tees output to a log.
+
+| Setting | Earlier Sky Garden, 15.67 FPS | Fresh retake, 11.67 FPS | Run A, normal profile | Run B, diagnostics |
+|---|---|---|---|---|
+| `KYTY_GPU_ZONES=1` | Yes | Yes | Yes | Yes |
+| `--gpu 0` | Yes | Yes | Yes | Yes |
+| `--amd-cpu` | Yes | Yes | Yes | Yes |
+| `--redzone` | Yes | Yes | Yes | Yes |
+| `--rewrite-vrsqrtps true` | Yes | Yes | Yes | Yes |
+| `--rewrite-extrq true` | Yes | Yes | Yes | Yes |
+| `--dcc-gpu-clear true` | Yes | Yes | Yes | Yes |
+| `--async-submit true` | Yes | Yes | Yes | Yes |
+| `--gpu-mesh-indirect true` | Yes | Yes | Yes | Yes |
+| `--label-flush-interval-us 2000` | Yes | Yes | Yes | Yes |
+| `--pipeline-libraries true` | Yes | Yes | Yes | Yes |
+| `--speculative-draws true` | Yes | Yes | Yes | Yes |
+| `--record-thread true` | Yes | Yes | Yes | Yes |
+| `--hardware-buffer-bounds true` | Yes | Yes | Yes | Yes |
+| `--relaxed-readback true` | Yes | Yes | Yes | Yes |
+| `--gpu-timestamp-scale 115` | Yes | Yes | Yes | Yes |
+| `--drain-stats 5` | Yes | Yes | Yes | Yes |
+| Extra diagnostic environment | `KYTY_DEBUG_DRAW_STATS=1`; `KYTY_DEBUG_DRAW_PHASES=all`; no queue snapshots | Same, plus `KYTY_DEBUG_QUEUES=1` | None beyond `KYTY_GPU_ZONES=1` | Draw stats, all draw phases, and queue snapshots enabled |
+| Executable | `_Build\windows\install\kyty_emulator.exe`; build 6881861 Release per profile record | Same path/build per prior record | Same file, SHA256 `BF8C4CA9C058E8AD40E66CDB5F975AB6A17E230227718B85A06CEA26CFF456D` | Same file/hash; no rebuild between A and B |
+| Pipeline-cache load | 42,658,066 bytes; 674 recorded permutations replayed | 42,658,066 bytes; 679 replayed | 42,927,848 bytes; 679 replayed | Same 42,927,848 bytes and 679 replayed |
+
+The earlier two capture logs do not contain per-run executable hashes. Their identity is supported by the profile record and the unchanged installed Release build; it is not an independently logged historical hash. The Run A and Run B logs both show the same current executable path/build. Both A and B started from the same preserved cache snapshot (SHA256 `8831a88abf8dca3588ed862fc5cbdacb34b485c6b5ace7b148a4833e46d25beb`). The historical cache was populated in both runs; the five-permutation difference between the two old logs and the larger A/B cache file are recorded facts, not evidence that cache state caused the busy/gap reversal.
+
+### Run A / Run B method
+
+Run A used the batch arguments with only `KYTY_GPU_ZONES=1`; `KYTY_DEBUG_DRAW_STATS`, `KYTY_DEBUG_DRAW_PHASES`, and `KYTY_DEBUG_QUEUES` were unset. Run B used the identical executable, command line and cache snapshot, with those three diagnostic variables enabled. Each was a visible interactive run. Loading and navigation windows were excluded. Rajiv confirmed the reference position for A. For B, Rajiv reported the scene loaded after receiving the same navigation instruction, but did not separately confirm the exact character and camera position; this limits how tightly the A/B scene state can be matched.
+
+**Reference scene:** Astro Bot, Sky Garden opening path. Astro stood centered on the pink stone path, facing the glass tower with the camera behind Astro. The large pink-leaf tree and blue bot bubble are to the right; grass borders the path. Screenshot reference: `codex-clipboard-380af6bb-a010-4903-bd9d-941dc726719a.png`.
+
+### Stable windows
+
+The values below are each complete 5-second `--drain-stats` interval. Frame time is inferred as 5 seconds divided by presents. All six windows report `#UD=0`, `full-drain=0`, `blocked-poll=0`, and `gpu-thread-idle=0`.
+
+| Run | Window | Presents / FPS | Implied frame ms | GPU busy ms/frame | GPU gap ms/frame |
+|---|---:|---:|---:|---:|---:|
+| A | 1 | 60 / 12.0 | 83.33 | 25.63 | 57.89 |
+| A | 2 | 60 / 12.0 | 83.33 | 24.51 | 58.70 |
+| A | 3 | 63 / 12.6 | 79.37 | 26.06 | 52.94 |
+| B | 1 | 65 / 13.0 | 76.92 | 29.49 | 47.11 |
+| B | 2 | 65 / 13.0 | 76.92 | 29.91 | 46.99 |
+| B | 3 | 66 / 13.2 | 75.76 | 29.87 | 45.92 |
+
+| Summary | FPS mean | Implied frame ms | GPU busy ms/frame | GPU gap ms/frame |
+|---|---:|---:|---:|---:|
+| A, normal profile | 12.20 | 81.97 | 25.41 | 56.45 |
+| B, diagnostics enabled | 13.07 | 76.53 | 29.76 | 46.67 |
+
+Busy plus gap sums to 81.86 ms/frame in A and 76.43 ms/frame in B, close to the respective inferred frame intervals. A had submit 1.29 ms/frame and queue-lock wait about 0.005 ms/frame; B had submit about 1.05 ms/frame and queue-lock wait below 0.01 ms/frame. These remain small in both runs.
+
+### Diagnostics overhead and discrepancy
+
+**MEASURED:** B was 0.87 FPS faster than A (+7.1%), with 5.44 ms/frame lower inferred frame time, 4.35 ms/frame more timestamped GPU busy time, and 9.78 ms/frame less GPU gap. The large gap persisted with diagnostics disabled in A and enabled in B. This result does not support extra diagnostics as the cause of the 32–63 ms gaps.
+
+**MEASURED limitation:** the A/B comparison did not directly time the CPU cost of the diagnostic code. A had no draw-phase/PM4 timers; B reported approximately 0.90–0.92 accumulated draw CPU-seconds per second and 0.96–0.98 PM4-handler CPU-seconds per second, which measure emulator workload and overlap each other. The queue diagnostic logs snapshots every five seconds. The A/B FPS delta is the observed net difference, not a direct isolated overhead measurement.
+
+**INFERRED:** the A/B is inconclusive for a small diagnostics overhead because the diagnostics-on run was faster and its busy/gap split changed substantially despite the same intended reference scene and identical cache. Exact B positioning was not reconfirmed, so scene-state variation remains a confound. The measured large gap itself is repeatable across both diagnostic settings. The earlier 31.61 ms Sky Garden gap is reproduced in the broader sense of a large gap: the new stable windows measured 45.92–58.70 ms/frame. The exact 31.61 ms value was not reproduced.
+
+**INFERRED:** the 3.09 ms gap from the prior fresh retake is not reproduced by either controlled run. All launch flags, executable/build identity, GPU selection, and A/B cache contents are matched here, so these do not explain the new A/B difference. The old retake did not record the exact held character/camera coordinates; a different scene state or natural frame-to-frame workload remains plausible.
+
+**HYPOTHESIS:** dynamic scene work or runtime GPU/CPU clock variation contributed to the A/B timing difference. Clock and power state were not captured, so this is not established.
+
+### Decision
+
+```text
+OPTIMUS BASELINE STATUS:
+REPRODUCIBLE
+
+REFERENCE SCENE:
+Sky Garden opening path; Astro centered on pink stone path, camera behind, facing glass tower; screenshot codex-clipboard-380af6bb-a010-4903-bd9d-941dc726719a.png
+
+REFERENCE CONFIG:
+launch_test_combined_fastpath.bat arguments; KYTY_GPU_ZONES=1; no draw/PM4/queue-state diagnostics; warm cache 42,927,848 bytes, 679 permutations
+
+REFERENCE FPS:
+12.20 mean (three 5-second windows)
+
+REFERENCE FRAME MS:
+81.97 ms inferred from 183 presents / 15 seconds
+
+REFERENCE GPU BUSY:
+25.41 ms/frame
+
+REFERENCE GPU GAP:
+56.45 ms/frame
+
+DIAGNOSTIC OVERHEAD:
+Not directly isolated. Diagnostics-on Run B measured +7.1% FPS, +4.35 ms/frame GPU busy, and -9.78 ms/frame GPU gap versus A; the result is inconclusive for overhead magnitude.
+
+EARLIER 31.61-MS GAP:
+REPRODUCED (large-gap behavior; new range 45.92–58.70 ms/frame)
+
+SAFE TO BEGIN dGPU-ONLY A/B:
+YES
+```
